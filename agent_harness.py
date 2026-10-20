@@ -14,7 +14,7 @@ import sys
 import duckdb
 from dotenv import load_dotenv
 
-from duckdb_agent import AgentConfig, configure_logging, init_traces_db, run_agent
+from duckdb_agent import AgentConfig, configure_logging, init_traces_db, reset_traces_db, run_agent
 from duckdb_agent.config import DEFAULT_EFFORT, DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, EFFORT_LEVELS
 
 DEFAULT_PROMPT = (
@@ -42,6 +42,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--schema", help="Schema to USE in that database. Default: gold for the default --db.")
     parser.add_argument("--traces-db", default="agent_traces.duckdb", help="Where to write traces.")
+    parser.add_argument(
+        "--reset-traces", action="store_true",
+        help="Delete the traces database before running, so this run starts the traces over."
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--effort", default=DEFAULT_EFFORT, choices=EFFORT_LEVELS)
     parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
@@ -74,6 +78,8 @@ def main(argv=None, client=None) -> int:
     configure_logging(verbose=not args.quiet)
 
     conn = connect(args.db, args.schema)
+    if args.reset_traces and reset_traces_db(args.traces_db):
+        print(f"Reset traces: deleted {args.traces_db}", file=sys.stderr)
     traces_conn = init_traces_db(args.traces_db)
     config = AgentConfig(
         model=args.model,
