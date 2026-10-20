@@ -1,9 +1,21 @@
 """The traces database: schema and writers for runs, API calls, tool calls, and events."""
 
 import duckdb
+import os
 from datetime import datetime
 
 from .usage import USAGE_FIELDS
+
+
+def reset_traces_db(traces_db_path: str = "agent_traces.duckdb") -> bool:
+    """Delete the traces database (and its write-ahead log) so the next init_traces_db starts
+    from an empty schema. Returns True if anything was deleted."""
+    deleted = False
+    for path in (traces_db_path, traces_db_path + ".wal"):
+        if os.path.exists(path):
+            os.remove(path)
+            deleted = True
+    return deleted
 
 
 def init_traces_db(traces_db_path: str = "agent_traces.duckdb") -> duckdb.DuckDBPyConnection:

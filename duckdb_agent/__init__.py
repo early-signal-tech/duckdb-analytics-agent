@@ -21,7 +21,7 @@ Modules:
 from .config import DEFAULT_CONFIG, AgentConfig
 from .log import configure_logging
 from .loop import AgentResult, run_agent
-from .tracing import init_traces_db
+from .tracing import init_traces_db, reset_traces_db
 
 __all__ = [
     "AgentConfig",
@@ -29,5 +29,6 @@ __all__ = [
     "DEFAULT_CONFIG",
     "configure_logging",
     "init_traces_db",
+    "reset_traces_db",
     "run_agent",
 ]

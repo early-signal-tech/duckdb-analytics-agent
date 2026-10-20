@@ -2,10 +2,6 @@
 
 A SQL-to-LLM agent: Claude (Haiku 5.5) answers questions about DuckDB or DuckLake data by writing read-only SQL, reading the results, and iterating until it can answer with evidence. Every step is traced to a DuckDB database.
 
-# Companion Video
-
-[![Companion Video](https://github.com/user-attachments/assets/fffb2f69-a9ff-4c18-abf5-9d5dc004fd20)](https://www.youtube.com/watch?v=kVey_qIXAJk)
-
 ## Quick start
 
 1. **API key.** Copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`.
@@ -16,6 +12,7 @@ A SQL-to-LLM agent: Claude (Haiku 5.5) answers questions about DuckDB or DuckLak
    uv run agent_harness.py --prompt "Which event types grew most last week?"
    uv run agent_harness.py --db analytics.duckdb --schema main --table orders --table customers
    uv run agent_harness.py --effort high --structured --quiet
+   uv run agent_harness.py --reset-traces      # delete the traces database first, starting the traces over
    uv run agent_harness.py --help
    ```
    The database is always attached read-only. Without `--table`, the agent finds tables itself. `--quiet` logs progress only and prints the answer; the default shows the full trace (SQL, thinking, results). Exit status is 0 when the run completes, 1 otherwise.
@@ -41,7 +38,7 @@ print(result.status, result.estimated_cost_usd)
 print(result.text)
 ```
 
-`result.status` is `completed` on a normal finish; anything else (`max_iterations`, `api_error`, `refusal`, ...) is explained in `AGENT_DESIGN.md`. With `AgentConfig(structured_answer=True)`, `result.answer` holds `summary`, `key_findings`, `caveats`, and `supporting_sql`.
+`result.status` is `completed` on a normal finish; anything else (`max_iterations`, `api_error`, `refusal`, ...) is described on `AgentResult` in `duckdb_agent/loop.py`. With `AgentConfig(structured_answer=True)`, `result.answer` holds `summary`, `key_findings`, `caveats`, and `supporting_sql`.
 
 The library logs through the `duckdb_agent` logger and adds no handlers; call `configure_logging(verbose=True)` for console output in scripts.
 
@@ -76,18 +73,11 @@ uv run pytest                                    # no API key needed
 uv run pytest --cov=duckdb_agent --cov-branch    # with coverage
 ```
 
-## Docs
-
-- `AGENT_DESIGN.md`: how it works (loop, tools, safety, caching, tracing, logging)
-- `UPGRADE_PLAN.md`: the upgrades from the original prototype
-- `TIER1_CHANGES.md`: the correctness and safety upgrades in detail
-- `DESIGN_NOTES.md`: history of the original prototype
-
 ## Layout
 
 ```
 ├── agent_harness.py       command-line entry point
-├── duckdb_agent/          the agent package (layout in AGENT_DESIGN.md)
+├── duckdb_agent/          the agent package
 ├── tests/                 pytest suite
 ├── .env.example           environment template
 └── pyproject.toml / uv.lock
