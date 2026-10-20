@@ -2,10 +2,6 @@
 
 A SQL-to-LLM agent: Claude (Haiku 5.5) answers questions about DuckDB or DuckLake data by writing read-only SQL, reading the results, and iterating until it can answer with evidence. Every step is traced to a DuckDB database.
 
-# Companion Video
-
-[![Companion Video](https://github.com/user-attachments/assets/fffb2f69-a9ff-4c18-abf5-9d5dc004fd20)](https://www.youtube.com/watch?v=kVey_qIXAJk)
-
 ## Quick start
 
 1. **API key.** Copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`.
