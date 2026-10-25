@@ -6,6 +6,7 @@ writes them. Reads look the same either way: traces_db.execute("SELECT ... FROM 
 """
 
 import duckdb
+import hashlib
 import os
 from datetime import datetime
 
@@ -41,6 +42,11 @@ TRACES_TABLES = {
         "source_db": "VARCHAR",
         "source_catalog": "VARCHAR",
         "source_schema": "VARCHAR",
+        # The tables the answer rests on (schema.table): from submit_answer's
+        # supporting_sql in structured runs ('supporting_sql'), else from the last
+        # successful query ('last_query'). NULL when the run didn't produce an answer.
+        "answer_tables": "VARCHAR[]",
+        "answer_tables_from": "VARCHAR",
         # Run timing and totals across all API calls.
         "started_at": "TIMESTAMP",
         "ended_at": "TIMESTAMP",
@@ -99,6 +105,10 @@ TRACES_TABLES = {
         "tool_call_id": "VARCHAR",
         "input_sql": "VARCHAR",  # query_database only; NULL for the other tools
         "tool_input": "VARIANT",
+        # The tables the call looked at, as schema.table: those list_tables returned, the
+        # one describe_table/sample_rows was given, or those a query reads (parsed, not
+        # run; NULL if it didn't parse). See the table_choices view.
+        "table_names": "VARCHAR[]",
         "output_rows": "INTEGER",
         "output_summary": "VARCHAR",
         "started_at": "TIMESTAMP",
@@ -152,13 +162,67 @@ REPLAY_SQL_VIEW = """
 """
 
 
+# One row per run and table it came across: how the agent looked at it, whether it
+# queried it, and whether the answer used it. Wrong answers often come from the wrong
+# table rather than wrong SQL, and this is where that shows:
+#     SELECT * FROM table_choices WHERE dropped           -- checked, then not used
+# `checked` means preloaded, described, or sampled; listing alone isn't checking.
+# `dropped`: checked or queried (even if the query failed), but not among the answer's
+# tables (once the run has an answer), or never successfully queried (while it runs,
+# or when it ended without an answer).
+TABLE_CHOICES_VIEW = """
+    CREATE OR REPLACE VIEW table_choices AS
+    WITH touches AS (
+        SELECT run_id, iteration, 'preloaded' AS how,
+               coalesce(query_result.table::VARCHAR, lower(tool_input.table::VARCHAR)) AS table_name
+        FROM agent_traces WHERE action = 'schema_lookup'
+        UNION ALL
+        SELECT run_id, iteration,
+               CASE tool_name  -- tool_calls holds the TOOL_LABELS names
+                   WHEN 'List Tables' THEN 'listed'
+                   WHEN 'Describe Table' THEN 'described'
+                   WHEN 'Sample Rows' THEN 'sampled'
+                   ELSE CASE WHEN success THEN 'queried' ELSE 'failed_query' END
+               END,
+               unnest(table_names)
+        FROM tool_calls WHERE table_names IS NOT NULL
+    ), per_table AS (
+        SELECT run_id, table_name,
+               bool_or(how = 'listed') AS listed,
+               bool_or(how = 'preloaded') AS preloaded,
+               bool_or(how = 'described') AS described,
+               bool_or(how = 'sampled') AS sampled,
+               count(*) FILTER (WHERE how = 'queried') AS queries,
+               count(*) FILTER (WHERE how = 'failed_query') AS failed_queries,
+               min(iteration) FILTER (WHERE how <> 'listed') AS first_used_iteration
+        FROM touches GROUP BY run_id, table_name
+    )
+    SELECT t.run_id, t.table_name, t.listed, t.preloaded, t.described, t.sampled,
+           t.preloaded OR t.described OR t.sampled AS checked,
+           t.queries, t.failed_queries, t.first_used_iteration,
+           list_contains(r.answer_tables, t.table_name) AS in_answer,
+           r.answer_tables_from,
+           (t.preloaded OR t.described OR t.sampled OR t.queries > 0 OR t.failed_queries > 0)
+               AND NOT coalesce(list_contains(r.answer_tables, t.table_name), t.queries > 0) AS dropped
+    FROM per_table t LEFT JOIN agent_runs r USING (run_id)
+"""
+
+
+# Changes whenever the tables or views do. A traces server records the version it set
+# up, so a client running newer code can tell the server is out of date and restart it.
+SCHEMA_VERSION = hashlib.sha256(
+    (repr(TRACES_TABLES) + REPLAY_SQL_VIEW + TABLE_CHOICES_VIEW).encode()
+).hexdigest()[:12]
+
+
 class TracesSchemaError(Exception):
     """The traces database exists but has a different schema (from an older version)."""
 
 
 def create_traces_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create the traces tables, sequences, and views in `conn` (a direct connection to
-    the file). A file from an older version is refused rather than half-migrated."""
+    the file). Columns added since a file was made are added to it; a file whose
+    columns have different types (from before DuckDB 2.0) is refused."""
     existing = {}
     for table, column, data_type in conn.execute("""
         SELECT table_name, column_name, data_type FROM information_schema.columns
@@ -168,8 +232,11 @@ def create_traces_schema(conn: duckdb.DuckDBPyConnection) -> None:
     for table, columns in TRACES_TABLES.items():
         if table not in existing:
             continue
-        expected = {name: spec.split()[0] for name, spec in columns.items()}
-        if existing[table] != expected:
+        changed = [
+            name for name, spec in columns.items()
+            if name in existing[table] and existing[table][name] != spec.split()[0]
+        ]
+        if changed:
             raise TracesSchemaError(
                 f"{table} in the traces database has an older schema. Start the traces over "
                 "with --reset-traces (or reset_traces_db), or point --traces-db at a new file."
@@ -180,7 +247,11 @@ def create_traces_schema(conn: duckdb.DuckDBPyConnection) -> None:
     for table, columns in TRACES_TABLES.items():
         column_ddl = ",\n".join(f"    {name} {spec}" for name, spec in columns.items())
         conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (\n{column_ddl}\n)")
+        for name, spec in columns.items():
+            if table in existing and name not in existing[table]:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec.split()[0]}")
     conn.execute(REPLAY_SQL_VIEW)
+    conn.execute(TABLE_CHOICES_VIEW)
 
 
 class TracesDB:
@@ -331,6 +402,7 @@ def log_tool_call(
     tool_call_id: str,
     input_sql: str = None,
     tool_input: dict = None,
+    table_names: list[str] = None,
     output_rows: int = None,
     output_summary: str = None,
     started_at: datetime = None,
@@ -348,6 +420,7 @@ def log_tool_call(
         "tool_call_id": tool_call_id,
         "input_sql": input_sql,
         "tool_input": tool_input,
+        "table_names": table_names,
         "output_rows": output_rows,
         "output_summary": output_summary,
         "started_at": started_at,
@@ -373,6 +446,8 @@ def log_run_summary(
     model: str = None,
     config: dict = None,
     source: dict = None,
+    answer_tables: list[str] = None,
+    answer_tables_from: str = None,
     started_at: datetime = None,
     duration_ms: int = None,
     api_calls: int = None,
@@ -399,6 +474,8 @@ def log_run_summary(
         "source_db": source.get("source_db"),
         "source_catalog": source.get("source_catalog"),
         "source_schema": source.get("source_schema"),
+        "answer_tables": answer_tables,
+        "answer_tables_from": answer_tables_from,
         "started_at": started_at,
         "ended_at": ended_at,
         "duration_ms": duration_ms,

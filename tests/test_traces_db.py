@@ -1,3 +1,4 @@
+import json
 import socket
 from types import SimpleNamespace
 
@@ -214,3 +215,17 @@ def test_server_that_fails_to_start_reports_why(tmp_path):
             traces_server.start_traces_server(path, free_port())
     finally:
         holder.close()
+
+
+def test_server_from_older_code_is_restarted(served):
+    path, port = served
+    connect_traces_db(path, port=port).close()
+    old_pid = server_status(path)["pid"]
+    # As if the running server had been started by older code.
+    state_file = state_paths(path)["json"]
+    state = json.loads(state_file.read_text())
+    state_file.write_text(json.dumps({**state, "schema_version": "older"}))
+    traces = connect_traces_db(path, port=port)
+    assert traces.remote
+    assert server_status(path)["pid"] != old_pid
+    traces.close()
