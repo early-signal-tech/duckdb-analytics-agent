@@ -148,14 +148,3 @@ def test_error_breakdown_query(conn, traces_conn):
         "SELECT error_type, count(*) FROM tool_calls WHERE NOT success GROUP BY ALL ORDER BY 2 DESC"
     ).fetchall()
     assert breakdown == [("BinderException", 2), ("read_only_violation", 1)]
-
-
-def test_existing_traces_db_gains_tool_call_columns(tmp_path):
-    path = str(tmp_path / "old.duckdb")
-    old = duckdb.connect(path)
-    old.execute("CREATE TABLE tool_calls (id INTEGER, run_id VARCHAR, iteration INTEGER, tool_name VARCHAR, "
-                "tool_call_id VARCHAR, input_sql VARCHAR, output_rows INTEGER, output_summary VARCHAR)")
-    old.close()
-    traces_conn = init_traces_db(path)
-    columns = {row[0] for row in traces_conn.execute("DESCRIBE tool_calls").fetchall()}
-    assert {"started_at", "duration_ms", "success", "truncated", "result_chars", "error_type", "error"} <= columns

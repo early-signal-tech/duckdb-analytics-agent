@@ -135,9 +135,9 @@ class AgentConfig:
         if not self.query_timeout_seconds or self.query_timeout_seconds <= 0:
             raise ValueError(f"query_timeout_seconds must be positive, not {self.query_timeout_seconds!r}")
 
-    def to_json(self) -> str:
-        """Settings as JSON for agent_runs.config. The system prompt actually sent (custom
-        or built) is recorded as a short hash, so runs can be grouped by prompt version
+    def to_dict(self) -> dict:
+        """Settings for agent_runs.config. The system prompt actually sent (custom or
+        built) is recorded as a short hash, so runs can be grouped by prompt version
         without storing the text each time."""
         # Imported here because prompts imports this module (for AgentConfig).
         from .prompts import build_system_prompt
@@ -145,7 +145,11 @@ class AgentConfig:
         settings = asdict(self)
         prompt = build_system_prompt(self)
         settings["system_prompt"] = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()[:12]
-        return json_dumps(settings)
+        return settings
+
+    def to_json(self) -> str:
+        """to_dict() as JSON."""
+        return json_dumps(self.to_dict())
 
 
 DEFAULT_CONFIG = AgentConfig()

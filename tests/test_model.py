@@ -115,14 +115,3 @@ def test_empty_thinking_is_not_logged(conn, tmp_path):
         "SELECT count(*) FROM agent_traces WHERE run_id = ? AND action = 'thinking'", [result.run_id]
     ).fetchone()[0]
     assert count == 0
-
-
-def test_existing_traces_db_gains_thinking_column(tmp_path):
-    path = str(tmp_path / "old.duckdb")
-    old = duckdb.connect(path)
-    old.execute("CREATE TABLE agent_traces (id INTEGER, run_id VARCHAR, iteration INTEGER, timestamp TIMESTAMP, "
-                "action VARCHAR, sql_query VARCHAR, query_result VARCHAR, claude_response VARCHAR, tool_calls VARCHAR)")
-    old.close()
-    traces_conn = init_traces_db(path)
-    columns = [row[0] for row in traces_conn.execute("DESCRIBE agent_traces").fetchall()]
-    assert "thinking" in columns

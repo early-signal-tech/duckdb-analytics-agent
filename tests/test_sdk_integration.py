@@ -138,11 +138,11 @@ def test_results_and_traces_from_real_responses(conn, two_turn_api, traces_conn)
     ).fetchall()
     assert request_ids == [("req_1",), ("req_2",)]
     actions = {row[0]: row[1] for row in traces_conn.execute(
-        "SELECT action, coalesce(thinking, claude_response) FROM agent_traces WHERE run_id = ? "
+        "SELECT action, coalesce(thinking, details.cleared_tool_uses::VARCHAR) FROM agent_traces WHERE run_id = ? "
         "AND action IN ('thinking', 'context_edit')", [result.run_id]
     ).fetchall()}
     assert actions["thinking"] == "Count the rows first."
-    assert json.loads(actions["context_edit"])["cleared_tool_uses"] == 2
+    assert actions["context_edit"] == "2"
 
 
 def test_bad_request_ends_the_run_with_request_id(conn, traces_conn):

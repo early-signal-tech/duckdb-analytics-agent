@@ -71,7 +71,7 @@ def test_main_runs_end_to_end(db, tmp_path, capsys):
     client = FakeClient(response("tool_use", tool_use("SELECT count(*) FROM orders")), response("end_turn", text("3 orders.")))
     traces = str(tmp_path / "traces.duckdb")
     status = agent_harness.main(
-        ["--db", db, "--schema", "sales", "--table", "orders", "--traces-db", traces, "--quiet"], client=client
+        ["--db", db, "--schema", "sales", "--table", "orders", "--traces-db", traces, "--no-traces-server", "--quiet"], client=client
     )
     assert status == 0
     assert capsys.readouterr().out.strip() == "3 orders."  # --quiet prints the answer to stdout
@@ -81,7 +81,7 @@ def test_main_runs_end_to_end(db, tmp_path, capsys):
 
 def test_main_exit_status_is_1_when_not_completed(db, tmp_path):
     client = FakeClient(response("max_tokens", text("cut off")))
-    status = agent_harness.main(["--db", db, "--traces-db", str(tmp_path / "t.duckdb"), "--quiet"], client=client)
+    status = agent_harness.main(["--db", db, "--traces-db", str(tmp_path / "t.duckdb"), "--no-traces-server", "--quiet"], client=client)
     assert status == 1
 
 
@@ -138,7 +138,7 @@ def test_save_db_runs_against_the_saved_file(tmp_path):
     csv.write_text("id\n1\n")
     path = tmp_path / "saved.duckdb"
     client = FakeClient(response("end_turn", text("done")))
-    args = ["--load", str(csv), "--save-db", str(path), "--traces-db", str(tmp_path / "t.duckdb"), "--quiet"]
+    args = ["--load", str(csv), "--save-db", str(path), "--traces-db", str(tmp_path / "t.duckdb"), "--no-traces-server", "--quiet"]
     assert agent_harness.main(args, client=client) == 0
     assert path.exists()
 

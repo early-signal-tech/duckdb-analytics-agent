@@ -78,7 +78,7 @@ def test_api_error_mid_run_is_traced(conn, traces_conn):
     actions = [a for (a,) in traces_conn.execute(
         "SELECT action FROM agent_traces WHERE run_id = ? ORDER BY id", [result.run_id]
     ).fetchall()]
-    assert actions == ["schema_lookup", "tool_call", "api_error"]
+    assert actions == ["run_start", "schema_lookup", "tool_call", "api_error"]
 
 
 def test_unexpected_exception_is_raised_after_writing_summary(conn, traces_conn):
