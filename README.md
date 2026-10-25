@@ -128,6 +128,18 @@ FROM tool_calls WHERE run_id = '<RUN ID>' ORDER BY id;
 SELECT iteration, thinking FROM agent_traces WHERE run_id = '<RUN ID>' AND action = 'thinking' ORDER BY id;
 ```
 
+**Which tables it chose.** Wrong answers often come from the wrong table, not wrong SQL, so every tool call logs the tables it looked at in `tool_calls.table_names` (as `schema.table`): what `list_tables` returned, the table `describe_table` or `sample_rows` was given, or the tables a query reads. Query tables are found by parsing the SQL, without running it again; CTE names are left out, and a query that doesn't parse gets NULL. Each run records `answer_tables`, the tables its answer rests on: from `supporting_sql` in `--structured` runs, otherwise from the last successful query (`answer_tables_from` says which). The `table_choices` view puts it together, one row per run and table:
+
+```sql
+-- Tables the agent checked (preloaded, described, or sampled) or queried, then didn't use for the answer
+SELECT run_id, table_name, described, sampled, queries, failed_queries, first_used_iteration
+FROM table_choices WHERE dropped ORDER BY run_id, first_used_iteration;
+
+-- How often each table gets checked and dropped, across runs
+SELECT table_name, count(*) FILTER (WHERE dropped) AS dropped, count(*) FILTER (WHERE in_answer) AS used
+FROM table_choices WHERE checked OR queries > 0 GROUP BY ALL ORDER BY dropped DESC;
+```
+
 **Re-running Claude's SQL.** `tool_calls.input_sql` holds each `query_database` query exactly as Claude sent it (NULL for the other tools, whose input is in `tool_input`). The `replay_sql` view turns each one into a script you can paste into a fresh `duckdb` session: it attaches the source database read-only under the same name, `USE`s the same schema (Claude's SQL relies on it for unqualified table names), and ends the query with a semicolon. Print it in list mode, because the default box output clips long values:
 
 ```sql

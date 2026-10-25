@@ -1,5 +1,7 @@
 """The tools Claude can call: definitions, catalog lookups, dispatch, and submit_answer."""
 
+import json
+
 import duckdb
 
 from .config import AgentConfig, DEFAULT_CONFIG, MAX_CELL_CHARS, MAX_RESULT_CHARS, MAX_RESULT_ROWS, QUERY_TIMEOUT_SECONDS
@@ -308,6 +310,62 @@ def run_tool(
     if name == "sample_rows":
         return sample_rows(conn, tool_input["table"], tool_input.get("n", DEFAULT_SAMPLE_ROWS), **limits, **timeout)
     return execute_query(conn, tool_input["sql"], **limits, **timeout)
+
+
+def referenced_tables(conn: duckdb.DuckDBPyConnection, sql: str) -> list[str] | None:
+    """The tables and views a query reads, as schema.table, sorted. None if it doesn't parse.
+
+    Found by parsing only (json_serialize_sql), never binding: binding would run table
+    functions such as read_csv again. CTE names are left out; names that don't resolve
+    to a table in the current database (a missing table, another attached database)
+    are kept as written, lowercased, so failed queries still show what they aimed at.
+    """
+    try:
+        ast = json.loads(conn.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0])
+    except (duckdb.Error, TypeError, ValueError):
+        return None
+    if ast.get("error"):
+        return None
+    references, ctes = [], set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "BASE_TABLE":
+                references.append((node.get("catalog_name"), node.get("schema_name"), node.get("table_name")))
+            cte_map = node.get("cte_map")
+            if isinstance(cte_map, dict):
+                ctes.update(entry.get("key", "").lower() for entry in cte_map.get("map", []))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(ast)
+    tables = set()
+    for catalog, schema, table in references:
+        if not table or (not catalog and not schema and table.lower() in ctes):
+            continue
+        name = ".".join(part for part in (catalog, schema, table) if part)
+        resolved, _ = resolve_table(conn, name)
+        tables.add(f"{resolved[0]}.{resolved[1]}" if resolved else name.lower())
+    return sorted(tables)
+
+
+def tables_touched(conn: duckdb.DuckDBPyConnection, name: str, tool_input: dict, result: dict) -> list[str] | None:
+    """The tables a tool call looked at, as schema.table: what list_tables returned, the
+    table describe_table or sample_rows was given, or what a query reads. None for
+    tools that don't look at tables."""
+    if name == "list_tables":
+        return [f"{row[0]}.{row[1]}" for row in result.get("rows", [])] if result.get("success") else []
+    if name in ("describe_table", "sample_rows"):
+        if result.get("table"):
+            return [result["table"]]
+        table = tool_input.get("table")
+        return [table.replace('"', "").strip().lower()] if isinstance(table, str) and table.strip() else []
+    if name == "query_database":
+        return referenced_tables(conn, tool_input.get("sql") or "")
+    return None
 
 
 def validate_answer(answer) -> str | None:

@@ -30,7 +30,7 @@ from pathlib import Path
 import duckdb
 
 from .log import logger
-from .tracing import TracesDB, create_traces_schema, init_traces_db
+from .tracing import SCHEMA_VERSION, TracesDB, create_traces_schema, init_traces_db
 
 
 DEFAULT_PORT = 9494  # Quack's default
@@ -106,10 +106,15 @@ def _pid_is_server(pid: int) -> bool:
 
 def start_traces_server(db_path: str, port: int = DEFAULT_PORT) -> dict:
     """Return the running server for `db_path`, starting one in the background if none
-    is answering. Raises TracesServerError if it can't be started."""
+    is answering. A server started by older code (a different SCHEMA_VERSION) is
+    restarted, so its tables and views match this code. Raises TracesServerError if
+    it can't be started."""
     state = server_status(db_path)
-    if state:
+    if state and state.get("schema_version") == SCHEMA_VERSION:
         return state
+    if state:
+        logger.info("Restarting the traces server (pid %s): it has an older traces schema.", state["pid"])
+        stop_traces_server(db_path)
     paths = state_paths(db_path)
     package_root = str(Path(__file__).resolve().parent.parent)
     env = {
@@ -128,7 +133,7 @@ def start_traces_server(db_path: str, port: int = DEFAULT_PORT) -> dict:
         # Checked before the exit code: if another run started a server at the same
         # moment, ours exits (the file is locked) but theirs serves the same file.
         state = server_status(db_path)
-        if state:
+        if state and state.get("schema_version") == SCHEMA_VERSION:
             return state
         if process.poll() is not None:
             raise TracesServerError(f"traces server exited with status {process.returncode}: {_log_tail(paths['log'])}")
@@ -186,7 +191,9 @@ def serve(db_path: str, port: int, token: str) -> None:
     uri = f"quack:localhost:{port}"
     conn.execute("CALL quack_serve(?, token = ?)", [uri, token])  # serves on background threads
     paths = state_paths(db_path)
-    _write_private(paths["json"], json.dumps({"pid": os.getpid(), "uri": uri, "token": token, "db": db_path}))
+    _write_private(paths["json"], json.dumps({
+        "pid": os.getpid(), "uri": uri, "token": token, "db": db_path, "schema_version": SCHEMA_VERSION
+    }))
     _write_private(paths["sql"], (
         "-- Connects the duckdb CLI to the traces server: duckdb -init <this file>\n"
         f"ATTACH '{uri}' AS traces (TYPE quack, TOKEN '{token}');\n"

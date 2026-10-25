@@ -13,7 +13,10 @@ from .log import logger
 from .prompts import MAX_ITERATIONS_WRAP_UP_PROMPT, build_system_prompt
 from .serialization import json_dumps
 from .sql import tool_error
-from .tools import TOOL_LABELS, build_tools, describe_table, format_answer, run_tool, tool_result_block, validate_answer
+from .tools import (
+    TOOL_LABELS, build_tools, describe_table, format_answer, referenced_tables, run_tool, tables_touched,
+    tool_result_block, validate_answer,
+)
 from .tracing import TracesDB, describe_source, log_api_call, log_run_summary, log_tool_call, log_trace
 from .usage import MODEL_PRICING, add_usage, estimate_cost
 
@@ -116,6 +119,7 @@ def run_agent(
         "usage": {},
         "api_calls": 0,
         "cost": 0.0 if config.model in MODEL_PRICING else None,
+        "last_query_tables": None,  # tables of the last successful query, for answer_tables
     }
 
     def finish(
@@ -143,6 +147,14 @@ def run_agent(
                     progress["api_calls"], duration_ms / 1000, cost_text)
         logger.debug("%s\nResponse:\n%s\n%s", "=" * 60, text, "=" * 60)
         if traces_conn:
+            answer_tables, answer_tables_from = None, None
+            if answer is not None:
+                answer_tables = sorted({
+                    table for sql in answer["supporting_sql"] for table in referenced_tables(conn, sql) or []
+                })
+                answer_tables_from = "supporting_sql"
+            elif status in ("completed", "max_iterations") and progress["last_query_tables"] is not None:
+                answer_tables, answer_tables_from = progress["last_query_tables"], "last_query"
             log_run_summary(
                 traces_conn,
                 run_id,
@@ -156,6 +168,8 @@ def run_agent(
                 model=config.model,
                 config=config.to_dict(),
                 source=source,
+                answer_tables=answer_tables,
+                answer_tables_from=answer_tables_from,
                 started_at=started_at,
                 duration_ms=duration_ms,
                 api_calls=progress["api_calls"],
@@ -427,6 +441,9 @@ def _run_agent_loop(
             tool_results.append(result_block)
 
             if traces_conn:
+                table_names = tables_touched(conn, block.name, block.input, result)
+                if block.name == "query_database" and result["success"] and table_names is not None:
+                    progress["last_query_tables"] = table_names
                 log_trace(
                     traces_conn,
                     run_id,
@@ -446,6 +463,7 @@ def _run_agent_loop(
                     block.id,
                     input_sql=sql,
                     tool_input=block.input,
+                    table_names=table_names,
                     output_rows=row_count,
                     output_summary="Success" if result.get("success") else f"Error: {result.get('error')}",
                     started_at=tool_started_at,

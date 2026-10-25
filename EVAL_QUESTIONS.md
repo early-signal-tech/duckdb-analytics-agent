@@ -524,6 +524,14 @@ SELECT iteration, action, tool_name,
 FROM agent_traces WHERE run_id = '<RUN ID>' ORDER BY id;
 ```
 
+**Table choices**: tables checked or queried but not used for the answer (see `table_choices` in the README). For a wrong answer, compare `answer_tables` to the table the question needed.
+```sql
+SELECT c.run_id, left(r.prompt, 60) AS prompt, r.answer_tables, c.table_name AS dropped_table,
+       c.described, c.sampled, c.queries, c.failed_queries
+FROM table_choices c JOIN agent_runs r USING (run_id)
+WHERE c.dropped ORDER BY r.started_at DESC, c.first_used_iteration;
+```
+
 **Context clearing events** (long runs only)
 ```sql
 SELECT run_id, iteration, details.cleared_tool_uses, details.cleared_input_tokens
