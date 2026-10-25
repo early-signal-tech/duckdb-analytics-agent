@@ -7,19 +7,25 @@
     uv run agent_harness.py --tpch                           # TPC-H sample data in memory
     uv run agent_harness.py --tpch --save-db tpch.duckdb --no-run   # build a reusable file
     uv run agent_harness.py --effort high --structured --quiet
+    uv run agent_harness.py --traces-shell                   # read the traces in the duckdb CLI
 
-The database is always attached READ_ONLY. Exit status is 0 when the run completes
+The database is always attached READ_ONLY. Traces are written through a background Quack
+server (started on first use, left running) so you can read them while a run writes;
+--stop-traces-server stops it. Exit status is 0 when the run completes
 normally and 1 otherwise (max iterations, API error, refusal, ...).
 """
 import argparse
+import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
 import duckdb
 from dotenv import load_dotenv
 
-from duckdb_agent import AgentConfig, configure_logging, init_traces_db, reset_traces_db, run_agent
+from duckdb_agent import AgentConfig, configure_logging, connect_traces_db, reset_traces_db, run_agent, stop_traces_server
+from duckdb_agent.traces_server import DEFAULT_PORT, TracesServerError, start_traces_server, state_paths
 from duckdb_agent.config import DEFAULT_EFFORT, DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, EFFORT_LEVELS
 
 IN_MEMORY = ":memory:"
@@ -75,6 +81,23 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--reset-traces", action="store_true",
         help="Delete the traces database before running, so this run starts the traces over."
+    )
+    parser.add_argument(
+        "--no-traces-server", action="store_true",
+        help="Write the traces file directly instead of through the background Quack server. "
+             "Other processes can't open the file while the run holds it."
+    )
+    parser.add_argument(
+        "--traces-port", type=int, default=DEFAULT_PORT,
+        help=f"Port for the traces server, on localhost. Default: {DEFAULT_PORT}."
+    )
+    parser.add_argument(
+        "--traces-shell", action="store_true",
+        help="Open the duckdb CLI connected to the traces server (starting it if needed), then exit."
+    )
+    parser.add_argument(
+        "--stop-traces-server", action="store_true",
+        help="Stop the background traces server, then exit."
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--effort", default=DEFAULT_EFFORT, choices=EFFORT_LEVELS)
@@ -163,10 +186,32 @@ def connect(db: str, schema: str | None, load: list[str] = (), tpch: float | Non
     return conn
 
 
+def open_traces_shell(traces_db: str, port: int) -> int:
+    """Replace this process with the duckdb CLI, connected to the traces server."""
+    try:
+        start_traces_server(traces_db, port)
+    except TracesServerError as e:
+        print(f"Traces server unavailable: {e}", file=sys.stderr)
+        return 1
+    init_script = str(state_paths(traces_db)["sql"])
+    duckdb_cli = shutil.which("duckdb")
+    if not duckdb_cli:
+        print(f"duckdb CLI not found on PATH. Install it, then run: duckdb -init {init_script}", file=sys.stderr)
+        return 1
+    os.execv(duckdb_cli, [duckdb_cli, "-init", init_script])
+
+
 def main(argv=None, client=None) -> int:
     args = parse_args(argv)
     load_dotenv()  # ANTHROPIC_API_KEY from .env
     configure_logging(verbose=not args.quiet)
+
+    if args.stop_traces_server:
+        stopped = stop_traces_server(args.traces_db)
+        print(f"Traces server {'stopped' if stopped else 'was not running'}.", file=sys.stderr)
+        return 0
+    if args.traces_shell:
+        return open_traces_shell(args.traces_db, args.traces_port)
 
     if args.save_db:
         build_database(args.save_db, args.load, args.tpch)
@@ -178,7 +223,7 @@ def main(argv=None, client=None) -> int:
         conn = connect(args.db, args.schema, args.load, args.tpch)
     if args.reset_traces and reset_traces_db(args.traces_db):
         print(f"Reset traces: deleted {args.traces_db}", file=sys.stderr)
-    traces_conn = init_traces_db(args.traces_db)
+    traces_conn = connect_traces_db(args.traces_db, server=not args.no_traces_server, port=args.traces_port)
     config = AgentConfig(
         model=args.model,
         effort=args.effort,

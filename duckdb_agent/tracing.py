@@ -1,15 +1,262 @@
-"""The traces database: schema and writers for runs, API calls, tool calls, and events."""
+"""The traces database: schema, connection, and writers for runs, API calls, tool calls, and events.
+
+A TracesDB writes either straight to the DuckDB file, or through a Quack server that
+owns the file (see traces_server), so other processes can read the traces while a run
+writes them. Reads look the same either way: traces_db.execute("SELECT ... FROM agent_runs").
+"""
 
 import duckdb
 import os
 from datetime import datetime
 
+from .serialization import json_dumps
 from .usage import USAGE_FIELDS
 
 
+# Every table's columns, in order. One definition drives the DDL, the insert casts
+# (VARIANT columns are bound as JSON text and cast), and the check that an existing
+# file has this schema.
+#
+# Rows are only ever inserted, never updated: Quack can't forward UPDATE or column
+# defaults that call a sequence, so ids come from TracesDB.next_id, not DEFAULT nextval.
+TRACES_TABLES = {
+    # One row per run, written when it ends. A run in progress has a 'run_start' row
+    # in agent_traces and no row here yet.
+    "agent_runs": {
+        "run_id": "VARCHAR PRIMARY KEY",
+        "timestamp": "TIMESTAMP",  # equals ended_at; kept for older queries
+        "initial_sql": "VARCHAR",
+        "table_name": "VARCHAR",
+        "prompt": "VARCHAR",
+        "final_response": "VARCHAR",
+        "total_iterations": "INTEGER",
+        "status": "VARCHAR",
+        "stop_reason": "VARCHAR",
+        "error": "VARCHAR",
+        # The run's settings: model on its own for easy filtering, the full AgentConfig
+        # (system prompt as a hash), so runs can be compared by configuration: config.effort.
+        "model": "VARCHAR",
+        "config": "VARIANT",
+        # The database the agent's SQL ran against (see describe_source).
+        "source_db": "VARCHAR",
+        "source_catalog": "VARCHAR",
+        "source_schema": "VARCHAR",
+        # Run timing and totals across all API calls.
+        "started_at": "TIMESTAMP",
+        "ended_at": "TIMESTAMP",
+        "duration_ms": "BIGINT",
+        "api_calls": "INTEGER",
+        "input_tokens": "BIGINT",
+        "cache_creation_input_tokens": "BIGINT",
+        "cache_read_input_tokens": "BIGINT",
+        "output_tokens": "BIGINT",
+        "estimated_cost_usd": "DOUBLE",
+    },
+    # Everything that happened in a run, in order: run_start, schema_lookup, tool_call,
+    # thinking, context_edit, claude_response, submit_answer, api_error, ...
+    "agent_traces": {
+        "id": "BIGINT PRIMARY KEY",
+        "run_id": "VARCHAR",
+        "iteration": "INTEGER",
+        "timestamp": "TIMESTAMP",
+        "action": "VARCHAR",
+        "sql_query": "VARCHAR",  # query_database only: the SQL exactly as Claude sent it
+        "tool_input": "VARIANT",  # every tool's input: tool_input.sql, tool_input.table, ...
+        "query_result": "VARIANT",  # the tool result: query_result.rows, query_result.error, ...
+        "claude_response": "VARCHAR",  # text only
+        "details": "VARIANT",  # structured events: run_start, context_edit, submit_answer
+        "tool_calls": "VARCHAR",
+        "tool_name": "VARCHAR",
+        # Claude's summarized reasoning, on rows with action = 'thinking' (one per response).
+        "thinking": "VARCHAR",
+    },
+    # One row per API call (successful or failed), for per-iteration token, latency,
+    # and cost breakdowns. request_id is what Anthropic support needs to look up a call.
+    "api_calls": {
+        "id": "BIGINT PRIMARY KEY",
+        "run_id": "VARCHAR",
+        "iteration": "INTEGER",
+        "started_at": "TIMESTAMP",
+        "latency_ms": "BIGINT",
+        "model": "VARCHAR",
+        "request_id": "VARCHAR",
+        "stop_reason": "VARCHAR",
+        "input_tokens": "BIGINT",
+        "cache_creation_input_tokens": "BIGINT",
+        "cache_read_input_tokens": "BIGINT",
+        "output_tokens": "BIGINT",
+        "estimated_cost_usd": "DOUBLE",
+        "error": "VARCHAR",
+    },
+    # One row per tool call: timing, outcome, and how big the result sent to Claude was
+    # (result_chars -- every result is resent on each later turn, so this is what drives
+    # context growth). error_type is a stable class; error is the full message.
+    "tool_calls": {
+        "id": "BIGINT PRIMARY KEY",
+        "run_id": "VARCHAR",
+        "iteration": "INTEGER",
+        "tool_name": "VARCHAR",
+        "tool_call_id": "VARCHAR",
+        "input_sql": "VARCHAR",  # query_database only; NULL for the other tools
+        "tool_input": "VARIANT",
+        "output_rows": "INTEGER",
+        "output_summary": "VARCHAR",
+        "started_at": "TIMESTAMP",
+        "duration_ms": "BIGINT",
+        "success": "BOOLEAN",
+        "truncated": "BOOLEAN",
+        "result_chars": "INTEGER",
+        "error_type": "VARCHAR",
+        "error": "VARCHAR",
+    },
+}
+
+
+# The id sequence of each table that has an id column.
+ID_SEQUENCES = {"agent_traces": "seq_traces", "api_calls": "seq_api_calls", "tool_calls": "seq_tool_calls"}
+
+
+# Each query Claude ran as a script you can paste into the duckdb CLI: attach the
+# source read-only, USE the same schema (Claude's SQL relies on it for unqualified
+# names), then the SQL, ending in a semicolon. A semicolon after a trailing -- comment
+# would be commented out, so it goes on its own line there. The setup comes from the
+# run_start event, so it's there while the run is still going.
+REPLAY_SQL_VIEW = """
+    CREATE OR REPLACE VIEW replay_sql AS
+    WITH sources AS (
+        SELECT run_id,
+               details.source_db::VARCHAR AS source_db,
+               details.source_catalog::VARCHAR AS source_catalog,
+               details.source_schema::VARCHAR AS source_schema
+        FROM agent_traces WHERE action = 'run_start'
+    ), queries AS (
+        SELECT id, run_id, iteration, started_at, success, error_type,
+               rtrim(trim(input_sql), '; ' || chr(10) || chr(9)) AS query
+        FROM tool_calls WHERE input_sql IS NOT NULL
+    )
+    SELECT q.id, q.run_id, q.iteration, q.started_at, q.success, q.error_type, q.query,
+           concat_ws(chr(10),
+               CASE
+                   WHEN s.source_db IS NOT NULL
+                   THEN 'ATTACH ''' || replace(s.source_db, '''', '''''') || ''' AS "'
+                        || s.source_catalog || '" (READ_ONLY);'
+                   WHEN s.source_catalog IS NOT NULL
+                   THEN '-- The source was an in-memory database: load the same data first.'
+               END,
+               CASE WHEN s.source_catalog IS NOT NULL
+                    THEN 'USE "' || s.source_catalog || '"."' || s.source_schema || '";' END,
+               q.query || CASE WHEN contains(regexp_extract(q.query, '[^\\n]*$'), '--')
+                               THEN chr(10) || ';' ELSE ';' END
+           ) AS script
+    FROM queries q LEFT JOIN sources s USING (run_id)
+"""
+
+
+class TracesSchemaError(Exception):
+    """The traces database exists but has a different schema (from an older version)."""
+
+
+def create_traces_schema(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the traces tables, sequences, and views in `conn` (a direct connection to
+    the file). A file from an older version is refused rather than half-migrated."""
+    existing = {}
+    for table, column, data_type in conn.execute("""
+        SELECT table_name, column_name, data_type FROM information_schema.columns
+        WHERE table_catalog = current_database() AND table_schema = 'main'
+    """).fetchall():
+        existing.setdefault(table, {})[column] = data_type
+    for table, columns in TRACES_TABLES.items():
+        if table not in existing:
+            continue
+        expected = {name: spec.split()[0] for name, spec in columns.items()}
+        if existing[table] != expected:
+            raise TracesSchemaError(
+                f"{table} in the traces database has an older schema. Start the traces over "
+                "with --reset-traces (or reset_traces_db), or point --traces-db at a new file."
+            )
+
+    for sequence in ID_SEQUENCES.values():
+        conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {sequence} START 1")
+    for table, columns in TRACES_TABLES.items():
+        column_ddl = ",\n".join(f"    {name} {spec}" for name, spec in columns.items())
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (\n{column_ddl}\n)")
+    conn.execute(REPLAY_SQL_VIEW)
+
+
+class TracesDB:
+    """A connection to the traces database. Write with insert(); read with execute().
+
+    Direct (`quack_uri` None): `conn` has the file open, and is the only process that can.
+    Remote: `conn` is an in-memory database with the Quack server's database attached
+    as `traces` and in USE, so the same unqualified SQL reads the same tables. Quack
+    (DuckDB 2.0.0) doesn't forward query parameters, so remote reads that pass `params`
+    fail: put literals in the SQL instead. insert() works around this for writes.
+    """
+
+    def __init__(self, conn: duckdb.DuckDBPyConnection, quack_uri: str = None, token: str = None):
+        self.conn = conn
+        self.quack_uri = quack_uri
+        self._token = token
+        self._staged = set()
+
+    @property
+    def remote(self) -> bool:
+        return self.quack_uri is not None
+
+    def execute(self, sql: str, params=None):
+        return self.conn.execute(sql, params) if params is not None else self.conn.execute(sql)
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def next_id(self, table: str) -> int:
+        sequence = ID_SEQUENCES[table]
+        if not self.remote:
+            return self.conn.execute(f"SELECT nextval('{sequence}')").fetchone()[0]
+        # quack_query runs the statement on the server, where the sequence lives.
+        return self.conn.execute(
+            "SELECT * FROM quack_query(?, ?, token = ?)",
+            [self.quack_uri, f"SELECT nextval('{sequence}')", self._token]
+        ).fetchone()[0]
+
+    def insert(self, table: str, row: dict) -> None:
+        """Insert one row. VARIANT columns take Python values (dicts, lists, ...), stored
+        as JSON-shaped VARIANTs; tables with an id column get the next id."""
+        columns = TRACES_TABLES[table]
+        if table in ID_SEQUENCES:
+            row = {"id": self.next_id(table), **row}
+        names = ", ".join(row)
+        placeholders = ", ".join(
+            "?::JSON::VARIANT" if columns[name] == "VARIANT" else "?" for name in row
+        )
+        values = [
+            json_dumps(value) if columns[name] == "VARIANT" and value is not None else value
+            for name, value in row.items()
+        ]
+        if not self.remote:
+            self.conn.execute(f"INSERT INTO {table} ({names}) VALUES ({placeholders})", values)
+            return
+        # Quack doesn't forward prepared-statement parameters, so the row is bound into
+        # a local temp table and copied across in one statement.
+        stage = f"temp.main.stage_{table}"
+        if table not in self._staged:
+            self.conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS stage_{table} AS FROM {table} LIMIT 0")
+            self._staged.add(table)
+        try:
+            self.conn.execute(f"INSERT INTO {stage} ({names}) VALUES ({placeholders})", values)
+            self.conn.execute(f"INSERT INTO {table} ({names}) SELECT {names} FROM {stage}")
+        finally:
+            self.conn.execute(f"DELETE FROM {stage}")
+
+
 def reset_traces_db(traces_db_path: str = "agent_traces.duckdb") -> bool:
-    """Delete the traces database (and its write-ahead log) so the next init_traces_db starts
-    from an empty schema. Returns True if anything was deleted."""
+    """Delete the traces database (and its write-ahead log) so the next connection starts
+    from an empty schema, stopping its Quack server first if one is running. Returns
+    True if anything was deleted."""
+    # Imported here because traces_server imports this module.
+    from .traces_server import stop_traces_server
+
+    stop_traces_server(traces_db_path)
     deleted = False
     for path in (traces_db_path, traces_db_path + ".wal"):
         if os.path.exists(path):
@@ -18,171 +265,72 @@ def reset_traces_db(traces_db_path: str = "agent_traces.duckdb") -> bool:
     return deleted
 
 
-def init_traces_db(traces_db_path: str = "agent_traces.duckdb") -> duckdb.DuckDBPyConnection:
-    """Initialize traces database with schema."""
-    traces_conn = duckdb.connect(traces_db_path)
+def init_traces_db(traces_db_path: str = "agent_traces.duckdb") -> TracesDB:
+    """Open the traces file directly (this process holds it) and create the schema.
+    To share it with readers in other processes, use connect_traces_db instead."""
+    conn = duckdb.connect(traces_db_path)
+    try:
+        create_traces_schema(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return TracesDB(conn)
 
-    traces_conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_traces START 1")
 
-    traces_conn.execute("""
-        CREATE TABLE IF NOT EXISTS agent_runs (
-            run_id VARCHAR,
-            timestamp TIMESTAMP,
-            initial_sql VARCHAR,
-            table_name VARCHAR,
-            prompt VARCHAR,
-            final_response VARCHAR,
-            total_iterations INTEGER,
-            PRIMARY KEY (run_id)
-        )
-    """)
-    traces_conn.execute("""
-        CREATE TABLE IF NOT EXISTS agent_traces (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_traces'),
-            run_id VARCHAR,
-            iteration INTEGER,
-            timestamp TIMESTAMP,
-            action VARCHAR,
-            sql_query VARCHAR,
-            query_result VARCHAR,
-            claude_response VARCHAR,
-            tool_calls VARCHAR,
-            tool_name VARCHAR
-        )
-    """)
-    traces_conn.execute(
-        "ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS tool_name VARCHAR"
-    )
-    # Claude's summarized reasoning, on rows with action = 'thinking' (one per response).
-    traces_conn.execute(
-        "ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS thinking VARCHAR"
-    )
-    traces_conn.execute(
-        "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS table_name VARCHAR"
-    )
-    traces_conn.execute(
-        "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS status VARCHAR"
-    )
-    traces_conn.execute(
-        "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS stop_reason VARCHAR"
-    )
-    traces_conn.execute(
-        "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS error VARCHAR"
-    )
-    # The run's settings: model on its own for easy filtering, the full AgentConfig as
-    # JSON (system prompt as a hash), so runs can be compared by configuration.
-    traces_conn.execute(
-        "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS model VARCHAR"
-    )
-    traces_conn.execute(
-        "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS config JSON"
-    )
-    # Run timing and totals across all API calls. `timestamp` is kept for older
-    # queries; it's written at the end of the run, so it equals ended_at.
-    for column, column_type in (
-        ("started_at", "TIMESTAMP"),
-        ("ended_at", "TIMESTAMP"),
-        ("duration_ms", "BIGINT"),
-        ("api_calls", "INTEGER"),
-        ("input_tokens", "BIGINT"),
-        ("cache_creation_input_tokens", "BIGINT"),
-        ("cache_read_input_tokens", "BIGINT"),
-        ("output_tokens", "BIGINT"),
-        ("estimated_cost_usd", "DOUBLE"),
-    ):
-        traces_conn.execute(f"ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS {column} {column_type}")
-
-    # One row per API call (successful or failed), for per-iteration token, latency,
-    # and cost breakdowns. request_id is what Anthropic support needs to look up a call.
-    traces_conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_api_calls START 1")
-    traces_conn.execute("""
-        CREATE TABLE IF NOT EXISTS api_calls (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_api_calls'),
-            run_id VARCHAR,
-            iteration INTEGER,
-            started_at TIMESTAMP,
-            latency_ms BIGINT,
-            model VARCHAR,
-            request_id VARCHAR,
-            stop_reason VARCHAR,
-            input_tokens BIGINT,
-            cache_creation_input_tokens BIGINT,
-            cache_read_input_tokens BIGINT,
-            output_tokens BIGINT,
-            estimated_cost_usd DOUBLE,
-            error VARCHAR
-        )
-    """)
-
-    traces_conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_tool_calls START 1")
-
-    traces_conn.execute("""
-        CREATE TABLE IF NOT EXISTS tool_calls (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_tool_calls'),
-            run_id VARCHAR,
-            iteration INTEGER,
-            tool_name VARCHAR,
-            tool_call_id VARCHAR,
-            input_sql VARCHAR,
-            output_rows INTEGER,
-            output_summary VARCHAR
-        )
-    """)
-    # Full detail per tool call: timing, outcome, and how big the result sent to Claude
-    # was (result_chars -- every result is resent on each later turn, so this is what
-    # drives context growth). error_type is a stable class; error is the full message.
-    for column, column_type in (
-        ("started_at", "TIMESTAMP"),
-        ("duration_ms", "BIGINT"),
-        ("success", "BOOLEAN"),
-        ("truncated", "BOOLEAN"),
-        ("result_chars", "INTEGER"),
-        ("error_type", "VARCHAR"),
-        ("error", "VARCHAR"),
-    ):
-        traces_conn.execute(f"ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS {column} {column_type}")
-
-    return traces_conn
+def describe_source(conn: duckdb.DuckDBPyConnection) -> dict:
+    """Where the agent's SQL runs: the current database's path as you'd ATTACH it
+    (None when in memory), its catalog name, and the current schema."""
+    try:
+        path, db_type, catalog, schema = conn.execute("""
+            SELECT path, type, current_database(), current_schema()
+            FROM duckdb_databases() WHERE database_name = current_database()
+        """).fetchone()
+    except (duckdb.Error, TypeError):
+        return {"source_db": None, "source_catalog": None, "source_schema": None}
+    if path and db_type != "duckdb":
+        path = f"{db_type}:{path}"  # e.g. ducklake:metadata.ducklake
+    return {"source_db": path, "source_catalog": catalog, "source_schema": schema}
 
 
 def log_trace(
-    traces_conn: duckdb.DuckDBPyConnection,
+    traces_conn: TracesDB,
     run_id: str,
     iteration: int,
     action: str,
     sql_query: str = None,
-    query_result: str = None,
+    tool_input: dict = None,
+    query_result: dict = None,
     claude_response: str = None,
+    details: dict = None,
     tool_calls: str = None,
     tool_name: str = None,
     thinking: str = None
 ):
-    """Log an agent trace to the database."""
-    traces_conn.execute("""
-        INSERT INTO agent_traces
-        (run_id, iteration, timestamp, action, sql_query, query_result, claude_response, tool_calls, tool_name, thinking)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        run_id,
-        iteration,
-        datetime.now(),
-        action,
-        sql_query,
-        query_result,
-        claude_response,
-        tool_calls,
-        tool_name,
-        thinking
-    ])
+    """Log an agent trace. tool_input, query_result, and details are stored as VARIANTs."""
+    traces_conn.insert("agent_traces", {
+        "run_id": run_id,
+        "iteration": iteration,
+        "timestamp": datetime.now(),
+        "action": action,
+        "sql_query": sql_query,
+        "tool_input": tool_input,
+        "query_result": query_result,
+        "claude_response": claude_response,
+        "details": details,
+        "tool_calls": tool_calls,
+        "tool_name": tool_name,
+        "thinking": thinking,
+    })
 
 
 def log_tool_call(
-    traces_conn: duckdb.DuckDBPyConnection,
+    traces_conn: TracesDB,
     run_id: str,
     iteration: int,
     tool_name: str,
     tool_call_id: str,
     input_sql: str = None,
+    tool_input: dict = None,
     output_rows: int = None,
     output_summary: str = None,
     started_at: datetime = None,
@@ -190,34 +338,30 @@ def log_tool_call(
     result: dict = None,
     result_chars: int = None
 ):
-    """Log a tool call execution to the database. `result` is the tool's result dict;
-    success, truncation, and error details are taken from it."""
+    """Log a tool call execution. `result` is the tool's result dict; success,
+    truncation, and error details are taken from it."""
     result = result or {}
-    traces_conn.execute("""
-        INSERT INTO tool_calls
-        (run_id, iteration, tool_name, tool_call_id, input_sql, output_rows, output_summary,
-         started_at, duration_ms, success, truncated, result_chars, error_type, error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        run_id,
-        iteration,
-        tool_name,
-        tool_call_id,
-        input_sql,
-        output_rows,
-        output_summary,
-        started_at,
-        duration_ms,
-        result.get("success"),
-        bool(result.get("truncated")) if result else None,
-        result_chars,
-        result.get("error_type"),
-        result.get("error")
-    ])
+    traces_conn.insert("tool_calls", {
+        "run_id": run_id,
+        "iteration": iteration,
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "input_sql": input_sql,
+        "tool_input": tool_input,
+        "output_rows": output_rows,
+        "output_summary": output_summary,
+        "started_at": started_at,
+        "duration_ms": duration_ms,
+        "success": result.get("success"),
+        "truncated": bool(result.get("truncated")) if result else None,
+        "result_chars": result_chars,
+        "error_type": result.get("error_type"),
+        "error": result.get("error"),
+    })
 
 
 def log_run_summary(
-    traces_conn: duckdb.DuckDBPyConnection,
+    traces_conn: TracesDB,
     run_id: str,
     table_name: str,
     prompt: str,
@@ -227,51 +371,48 @@ def log_run_summary(
     stop_reason: str = None,
     error: str = None,
     model: str = None,
-    config: str = None,
+    config: dict = None,
+    source: dict = None,
     started_at: datetime = None,
     duration_ms: int = None,
     api_calls: int = None,
     usage: dict = None,
     estimated_cost_usd: float = None
 ):
-    """Log the summary of an agent run. `config` is AgentConfig.to_json(); `usage` is
-    AgentResult.usage (token totals by USAGE_FIELDS name)."""
+    """Log the summary of an agent run. `config` is AgentConfig.to_dict(); `source` is
+    describe_source(); `usage` is AgentResult.usage (token totals by USAGE_FIELDS name)."""
     ended_at = datetime.now()
     usage = usage or {}
-    traces_conn.execute("""
-        INSERT INTO agent_runs
-        (run_id, timestamp, initial_sql, table_name, prompt, final_response, total_iterations,
-         status, stop_reason, error, model, config,
-         started_at, ended_at, duration_ms, api_calls, input_tokens, cache_creation_input_tokens,
-         cache_read_input_tokens, output_tokens, estimated_cost_usd)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        run_id,
-        ended_at,
-        None,
-        table_name,
-        prompt,
-        final_response,
-        total_iterations,
-        status,
-        stop_reason,
-        error,
-        model,
-        config,
-        started_at,
-        ended_at,
-        duration_ms,
-        api_calls,
-        usage.get("input_tokens"),
-        usage.get("cache_creation_input_tokens"),
-        usage.get("cache_read_input_tokens"),
-        usage.get("output_tokens"),
-        estimated_cost_usd
-    ])
+    source = source or {}
+    traces_conn.insert("agent_runs", {
+        "run_id": run_id,
+        "timestamp": ended_at,
+        "table_name": table_name,
+        "prompt": prompt,
+        "final_response": final_response,
+        "total_iterations": total_iterations,
+        "status": status,
+        "stop_reason": stop_reason,
+        "error": error,
+        "model": model,
+        "config": config,
+        "source_db": source.get("source_db"),
+        "source_catalog": source.get("source_catalog"),
+        "source_schema": source.get("source_schema"),
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_ms": duration_ms,
+        "api_calls": api_calls,
+        "input_tokens": usage.get("input_tokens"),
+        "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+        "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "estimated_cost_usd": estimated_cost_usd,
+    })
 
 
 def log_api_call(
-    traces_conn: duckdb.DuckDBPyConnection,
+    traces_conn: TracesDB,
     run_id: str,
     iteration: int,
     started_at: datetime,
@@ -284,21 +425,18 @@ def log_api_call(
     error: str = None
 ):
     """Log one API call. `usage` is the response's usage object (None for failed calls)."""
-    traces_conn.execute("""
-        INSERT INTO api_calls
-        (run_id, iteration, started_at, latency_ms, model, request_id, stop_reason, input_tokens,
-         cache_creation_input_tokens, cache_read_input_tokens, output_tokens, estimated_cost_usd, error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        run_id,
-        iteration,
-        started_at,
-        latency_ms,
-        model,
-        request_id,
-        stop_reason,
+    row = {
+        "run_id": run_id,
+        "iteration": iteration,
+        "started_at": started_at,
+        "latency_ms": latency_ms,
+        "model": model,
+        "request_id": request_id,
+        "stop_reason": stop_reason,
+    }
+    for name in USAGE_FIELDS:
         # Unused cache fields come back as None; store 0 so sums work.
-        *((getattr(usage, name, None) or 0) if usage is not None else None for name in USAGE_FIELDS),
-        estimated_cost_usd,
-        error
-    ])
+        row[name] = (getattr(usage, name, None) or 0) if usage is not None else None
+    row["estimated_cost_usd"] = estimated_cost_usd
+    row["error"] = error
+    traces_conn.insert("api_calls", row)

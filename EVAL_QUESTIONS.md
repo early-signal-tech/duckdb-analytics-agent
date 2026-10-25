@@ -428,7 +428,7 @@ done < evals.psv
 
 To compare settings, run the batch again with a flag added (for example `--effort high`); each run's settings are in `agent_runs.config`. At the current cost (about $0.004 per run), a full pass of 37 questions costs roughly $0.15.
 
-Load the eval list into the traces database once, so runs can be matched to questions:
+Load the eval list into the traces database once, so runs can be matched to questions. Run it from the traces shell (section 4); with `CONNECT`, the file is read by the traces server, which runs in the directory it was first started from, so use an absolute path if that isn't the repo:
 
 ```sql
 CREATE OR REPLACE TABLE evals AS
@@ -440,12 +440,12 @@ SELECT * FROM read_csv('evals.psv', delim = '|', header = false, quote = '',
 
 ## 4. Trace queries
 
-Run these in `agent_traces.duckdb` (`duckdb agent_traces.duckdb`, or Python with `duckdb.connect("agent_traces.duckdb")`).
+Run these in the traces shell: `uv run agent_harness.py --traces-shell` (or `duckdb -init agent_traces.duckdb.quack.sql`), which connects to the background traces server, so it works while runs are writing. Replace `<RUN ID>` with a run ID from `agent_runs`.
 
 **Latest run scorecard**
 ```sql
 SELECT r.run_id, r.status, r.total_iterations, r.api_calls, r.duration_ms / 1000 AS seconds,
-       round(r.estimated_cost_usd, 4) AS cost_usd, r.config->>'effort' AS effort,
+       round(r.estimated_cost_usd, 4) AS cost_usd, r.config.effort::VARCHAR AS effort,
        (SELECT count(*) FROM tool_calls t WHERE t.run_id = r.run_id) AS tool_calls,
        (SELECT count(*) FROM tool_calls t WHERE t.run_id = r.run_id AND NOT t.success) AS tool_errors,
        (SELECT count(*) FROM tool_calls t WHERE t.run_id = r.run_id AND t.truncated) AS truncated_results
@@ -470,7 +470,7 @@ GROUP BY ALL ORDER BY l.id;
 
 **Compare settings** (for example effort levels across the same eval set)
 ```sql
-SELECT r.config->>'effort' AS effort, r.model, count(*) AS runs,
+SELECT r.config.effort::VARCHAR AS effort, r.model, count(*) AS runs,
        avg((r.status = 'completed')::INT) AS completed_rate,
        avg(r.total_iterations) AS avg_iterations,
        avg(r.estimated_cost_usd) AS avg_cost_usd,
@@ -508,7 +508,7 @@ WHERE regexp_matches(lower(input_sql), 'read_(csv|parquet|json|text|blob)|glob\(
 SELECT iteration, latency_ms, input_tokens, cache_read_input_tokens, cache_creation_input_tokens,
        output_tokens, round(estimated_cost_usd, 5) AS cost_usd,
        round(cache_read_input_tokens / nullif(input_tokens + cache_read_input_tokens + cache_creation_input_tokens, 0), 3) AS cached_share
-FROM api_calls WHERE run_id = ? ORDER BY id;
+FROM api_calls WHERE run_id = '<RUN ID>' ORDER BY id;
 ```
 
 **Slowest and largest tool calls**
@@ -520,13 +520,14 @@ FROM tool_calls ORDER BY duration_ms DESC LIMIT 10;
 **Replay a run step by step**: reasoning, queries, and the answer
 ```sql
 SELECT iteration, action, tool_name,
-       left(coalesce(thinking, sql_query, claude_response), 200) AS detail
-FROM agent_traces WHERE run_id = ? ORDER BY id;
+       left(coalesce(thinking, sql_query, tool_input::JSON::VARCHAR, claude_response), 200) AS detail
+FROM agent_traces WHERE run_id = '<RUN ID>' ORDER BY id;
 ```
 
 **Context clearing events** (long runs only)
 ```sql
-SELECT run_id, iteration, claude_response AS edit FROM agent_traces WHERE action = 'context_edit';
+SELECT run_id, iteration, details.cleared_tool_uses, details.cleared_input_tokens
+FROM agent_traces WHERE action = 'context_edit';
 ```
 
 ---

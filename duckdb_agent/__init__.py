@@ -12,7 +12,8 @@ Modules:
     tools         tool definitions, catalog lookups, dispatch, submit_answer
     sql           read-only check, query execution, timeouts, result-size limits
     prompts       system prompt and wrap-up instructions
-    tracing       traces database schema and writers
+    tracing       traces database schema, TracesDB, and writers
+    traces_server background Quack server that shares the traces database with readers
     usage         token totals and cost estimates
     log           logger and configure_logging
     serialization DuckDB values to JSON
@@ -21,14 +22,18 @@ Modules:
 from .config import DEFAULT_CONFIG, AgentConfig
 from .log import configure_logging
 from .loop import AgentResult, run_agent
-from .tracing import init_traces_db, reset_traces_db
+from .traces_server import connect_traces_db, stop_traces_server
+from .tracing import TracesDB, init_traces_db, reset_traces_db
 
 __all__ = [
     "AgentConfig",
     "AgentResult",
     "DEFAULT_CONFIG",
+    "TracesDB",
     "configure_logging",
+    "connect_traces_db",
     "init_traces_db",
     "reset_traces_db",
     "run_agent",
+    "stop_traces_server",
 ]

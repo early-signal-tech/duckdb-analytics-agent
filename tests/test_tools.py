@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 
 import duckdb
@@ -217,11 +216,11 @@ def test_submit_answer_ends_run_with_structured_answer(conn, tmp_path):
     assert "Caveats:\n- Only two days of data." in result.text
 
     action, logged = traces_conn.execute(
-        "SELECT action, claude_response FROM agent_traces WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT action, details FROM agent_traces WHERE run_id = ? ORDER BY id DESC LIMIT 1",
         [result.run_id]
     ).fetchone()
     assert action == "submit_answer"
-    assert json.loads(logged) == ANSWER
+    assert logged == ANSWER
 
 
 def test_invalid_submit_answer_gets_error_and_can_retry(conn):

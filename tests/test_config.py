@@ -147,8 +147,8 @@ def test_run_summary_records_model_and_config(conn, tmp_path):
         "SELECT model, config FROM agent_runs WHERE run_id = ?", [result.run_id]
     ).fetchone()
     assert model == "claude-haiku-5-5"
-    assert json.loads(recorded) == json.loads(config.to_json())
+    assert recorded == config.to_dict()  # a VARIANT comes back as a dict
     effort = traces_conn.execute(
-        "SELECT config->>'effort' FROM agent_runs WHERE run_id = ?", [result.run_id]
+        "SELECT config.effort::VARCHAR FROM agent_runs WHERE run_id = ?", [result.run_id]
     ).fetchone()[0]
     assert effort == "high"

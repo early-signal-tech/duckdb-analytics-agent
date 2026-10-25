@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 
 import duckdb
@@ -72,13 +71,13 @@ def test_applied_edits_are_logged(conn, tmp_path):
     cleared.context_management = SimpleNamespace(applied_edits=[edit()])
     result = run(conn, FakeClient(cleared), traces_conn=traces_conn)
     rows = traces_conn.execute(
-        "SELECT iteration, claude_response FROM agent_traces WHERE run_id = ? AND action = 'context_edit'",
+        "SELECT iteration, details FROM agent_traces WHERE run_id = ? AND action = 'context_edit'",
         [result.run_id]
     ).fetchall()
     assert len(rows) == 1
     iteration, details = rows[0]
     assert iteration == 1
-    assert json.loads(details) == {
+    assert details == {
         "type": "clear_tool_uses_20250919",
         "cleared_tool_uses": 4,
         "cleared_input_tokens": 30_000,

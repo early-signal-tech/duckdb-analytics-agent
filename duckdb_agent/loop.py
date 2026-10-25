@@ -14,7 +14,7 @@ from .prompts import MAX_ITERATIONS_WRAP_UP_PROMPT, build_system_prompt
 from .serialization import json_dumps
 from .sql import tool_error
 from .tools import TOOL_LABELS, build_tools, describe_table, format_answer, run_tool, tool_result_block, validate_answer
-from .tracing import log_api_call, log_run_summary, log_tool_call, log_trace
+from .tracing import TracesDB, describe_source, log_api_call, log_run_summary, log_tool_call, log_trace
 from .usage import MODEL_PRICING, add_usage, estimate_cost
 
 
@@ -87,7 +87,7 @@ def run_agent(
     prompt: str,
     tables: str | list[str] | None = None,
     config: AgentConfig = DEFAULT_CONFIG,
-    traces_conn: duckdb.DuckDBPyConnection = None,
+    traces_conn: TracesDB = None,
     client: anthropic.Anthropic = None
 ) -> AgentResult:
     """Run the SQL-to-LLM agent loop.
@@ -108,6 +108,7 @@ def run_agent(
     summary_written = False
     tables = [tables] if isinstance(tables, str) else list(tables or [])
     table_name = ", ".join(tables) or None  # for the agent_runs trace
+    source = describe_source(conn)  # what database the SQL runs against, for replaying it
     started_at, start_clock = datetime.now(), time.monotonic()
     # Shared with the loop. cost stays None for models without pricing.
     progress = {
@@ -153,7 +154,8 @@ def run_agent(
                 stop_reason=stop_reason,
                 error=error,
                 model=config.model,
-                config=config.to_json(),
+                config=config.to_dict(),
+                source=source,
                 started_at=started_at,
                 duration_ms=duration_ms,
                 api_calls=progress["api_calls"],
@@ -167,6 +169,12 @@ def run_agent(
         )
 
     try:
+        if traces_conn:
+            # Logged first, so readers can see a run in progress (agent_runs is written
+            # at the end) and replay its SQL against the right database.
+            log_trace(traces_conn, run_id, 0, "run_start", details={
+                **source, "model": config.model, "tables": tables, "prompt": prompt
+            })
         return _run_agent_loop(conn, tables, prompt, config, traces_conn, client, run_id, finish, progress)
     except BaseException as e:
         if not summary_written:
@@ -184,7 +192,7 @@ def _run_agent_loop(
     tables: list[str],
     prompt: str,
     config: AgentConfig,
-    traces_conn: duckdb.DuckDBPyConnection,
+    traces_conn: TracesDB,
     client: anthropic.Anthropic,
     run_id: str,
     finish,
@@ -221,8 +229,8 @@ def _run_agent_loop(
                 run_id,
                 0,
                 "schema_lookup",
-                sql_query=f"describe_table {table}",
-                query_result=json_dumps(schema_result)
+                tool_input={"table": table},
+                query_result=schema_result
             )
 
         if schema_result["success"]:
@@ -308,7 +316,7 @@ def _run_agent_loop(
             details = edit.model_dump() if hasattr(edit, "model_dump") else vars(edit)
             logger.info("  context edit: %s", details)
             if traces_conn:
-                log_trace(traces_conn, run_id, iteration, "context_edit", claude_response=json_dumps(details))
+                log_trace(traces_conn, run_id, iteration, "context_edit", details=details)
         thinking = response_thinking(response)
         if thinking:
             first_line = thinking.strip().splitlines()[0]
@@ -377,7 +385,7 @@ def _run_agent_loop(
                         run_id,
                         iteration,
                         "submit_answer",
-                        claude_response=json_dumps(answer),
+                        details=answer,
                         tool_calls=tool_uses[0].id,
                         tool_name=TOOL_LABELS["submit_answer"]
                     )
@@ -386,10 +394,11 @@ def _run_agent_loop(
         tool_results = []
         for block in tool_uses:
             tool_name = TOOL_LABELS.get(block.name, block.name)
-            # query_database logs its SQL; the other tools log their JSON input.
-            sql = block.input.get("sql") if block.name == "query_database" else json_dumps(block.input)
+            # Every tool's input is logged as tool_input; query_database's SQL also goes
+            # in its own column, as plain text ready to copy and run.
+            sql = block.input.get("sql") if block.name == "query_database" else None
             logger.info("  Tool: %s (%s)", tool_name, block.id)
-            logger.debug("  Input: %s...", (sql or "")[:80])
+            logger.debug("  Input: %s...", (sql or json_dumps(block.input))[:80])
             tool_started_at, tool_clock = datetime.now(), time.monotonic()
             if config.structured_answer and block.name == "submit_answer":
                 if len(tool_uses) == 1:
@@ -424,7 +433,8 @@ def _run_agent_loop(
                     iteration,
                     "tool_call",
                     sql_query=sql,
-                    query_result=json_dumps(result),
+                    tool_input=block.input,
+                    query_result=result,
                     tool_calls=block.id,
                     tool_name=tool_name
                 )
@@ -435,6 +445,7 @@ def _run_agent_loop(
                     tool_name,
                     block.id,
                     input_sql=sql,
+                    tool_input=block.input,
                     output_rows=row_count,
                     output_summary="Success" if result.get("success") else f"Error: {result.get('error')}",
                     started_at=tool_started_at,

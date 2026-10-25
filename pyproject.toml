@@ -3,12 +3,12 @@ name = "duck-harness"
 version = "0.1.0"
 description = "SQL-to-LLM agent harness using DuckDB and Anthropic Claude"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     # 1.x SDK: top-level cache_control and the context-management beta.
     "anthropic>=1.5.0",
-    # Tested on 1.5.x (catalog functions, extract_statements, DuckLake READ_ONLY attach).
-    "duckdb>=1.5.0",
+    # 2.0: Quack (the traces server) and VARIANT trace columns. Needs Python 3.11+.
+    "duckdb>=2.0.0",
     "python-dotenv>=1.0.0",
 ]
 

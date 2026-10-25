@@ -148,14 +148,3 @@ def test_unpriced_model_has_no_cost(conn, traces_conn):
     assert result.estimated_cost_usd is None
     cost = traces_conn.execute("SELECT estimated_cost_usd FROM agent_runs WHERE run_id = ?", [result.run_id]).fetchone()[0]
     assert cost is None
-
-
-def test_existing_traces_db_gains_new_columns(tmp_path):
-    path = str(tmp_path / "old.duckdb")
-    old = duckdb.connect(path)
-    old.execute("CREATE TABLE agent_runs (run_id VARCHAR PRIMARY KEY, timestamp TIMESTAMP, initial_sql VARCHAR, "
-                "prompt VARCHAR, final_response VARCHAR, total_iterations INTEGER)")
-    old.close()
-    traces_conn = init_traces_db(path)
-    columns = {row[0] for row in traces_conn.execute("DESCRIBE agent_runs").fetchall()}
-    assert {"started_at", "ended_at", "duration_ms", "api_calls", "estimated_cost_usd", "output_tokens"} <= columns

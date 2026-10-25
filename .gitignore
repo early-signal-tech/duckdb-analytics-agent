@@ -30,6 +30,10 @@ htmlcov/
 *.duckdb.tmp
 *.db
 *.db.wal
+# Traces server state (holds the access token) and log
+*.quack.json
+*.quack.sql
+*.quack.log
 .tmp/
 
 # OS / editor

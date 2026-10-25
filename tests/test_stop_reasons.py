@@ -136,4 +136,4 @@ def test_status_and_stop_reason_are_traced(conn, traces_conn):
     actions = traces_conn.execute(
         "SELECT action FROM agent_traces WHERE run_id = ? ORDER BY id", [result.run_id]
     ).fetchall()
-    assert actions == [("schema_lookup",), ("max_tokens",)]
+    assert actions == [("run_start",), ("schema_lookup",), ("max_tokens",)]
