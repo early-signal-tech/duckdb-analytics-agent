@@ -9,7 +9,8 @@ caller picks) and a "type"; every message names the request it belongs to by "id
 Requests:
     {"id": "h", "type": "hello"}
         -> {"id": "h", "type": "hello", "protocol": 1, "defaults": {...AgentConfig fields},
-            "effort_levels": [...], "priced_models": [...]}
+            "effort_levels": [...], "priced_models": [...], "limits": {"max_tokens": ...},
+            "tools": [...]}
     {"id": "r1", "type": "run", "prompt": "...",
      "source": {"db": "tpch.duckdb", "schema": null} | {"load": ["a.csv"], "tpch": 0.1},
      "tables": ["orders"], "config": {"effort": "high", "max_iterations": 10, ...},
@@ -40,7 +41,7 @@ import anthropic
 import duckdb
 from dotenv import load_dotenv
 
-from .config import API_MAX_RETRIES, DEFAULT_CONFIG, EFFORT_LEVELS, AgentConfig
+from .config import API_MAX_RETRIES, DEFAULT_CONFIG, EFFORT_LEVELS, MAX_NON_STREAMING_TOKENS, TOOL_NAMES, AgentConfig
 from .log import configure_logging, logger
 from .loop import run_agent
 from .serialization import json_dumps
@@ -217,6 +218,10 @@ class Server:
                 "defaults": dataclasses.asdict(DEFAULT_CONFIG),
                 "effort_levels": list(EFFORT_LEVELS),
                 "priced_models": sorted(MODEL_PRICING),
+                # For a UI's controls: the largest safe max_tokens, and the tools that
+                # context_protected_tools can name.
+                "limits": {"max_tokens": MAX_NON_STREAMING_TOKENS},
+                "tools": list(TOOL_NAMES),
             })
         elif kind == "run":
             self.start_run(request)

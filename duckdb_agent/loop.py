@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .config import API_MAX_RETRIES, AgentConfig, CACHE_CONTROL, CONTEXT_MANAGEMENT, CONTEXT_MANAGEMENT_BETA, DEFAULT_CONFIG, THINKING
+from .config import API_MAX_RETRIES, AgentConfig, CACHE_CONTROL, CONTEXT_MANAGEMENT_BETA, DEFAULT_CONFIG, THINKING
 from .log import logger
 from .prompts import MAX_ITERATIONS_WRAP_UP_PROMPT, build_system_prompt
 from .serialization import json_dumps
@@ -292,7 +292,7 @@ def _run_agent_loop(
     # off, no beta is requested and the endpoint behaves like the standard one.
     context_params = {
         "betas": [CONTEXT_MANAGEMENT_BETA],
-        "context_management": CONTEXT_MANAGEMENT,
+        "context_management": config.context_management(),
     } if config.context_editing else {}
 
     # Preload the schema of each focus table, saving Claude a describe_table call.

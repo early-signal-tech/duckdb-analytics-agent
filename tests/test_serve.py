@@ -225,3 +225,23 @@ def test_bad_preset_or_labels_get_an_error(db, fields, message):
     (reply,) = out.messages
     assert reply["type"] == "error"
     assert message in reply["error"]
+
+
+def test_hello_reports_limits_and_tools():
+    srv, out = server()
+    srv.handle({"id": "h", "type": "hello"})
+    (hello,) = out.messages
+    assert hello["limits"]["max_tokens"] == 21_000
+    assert "query_database" in hello["tools"]
+    assert hello["defaults"]["context_protected_tools"] == ["list_tables", "describe_table"]
+
+
+def test_compressor_settings_arrive_through_the_protocol(db):
+    client = FakeClient(response("end_turn", text("ok")))
+    srv, out = server(client)
+    srv.handle({"id": "r", "type": "run", "prompt": "q", "source": {"db": db},
+                "config": {"context_trigger_tokens": 40_000, "context_protected_tools": ["describe_table"]}})
+    srv.wait_all()
+    assert out.of("r")[-1]["type"] == "result"
+    (edit,) = client.last_kwargs["context_management"]["edits"]
+    assert edit["trigger"]["value"] == 40_000 and edit["exclude_tools"] == ["describe_table"]

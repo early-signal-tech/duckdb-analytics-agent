@@ -108,3 +108,46 @@ def test_history_we_send_is_never_trimmed(conn):
     first_result = client.sent_messages[2][2]["content"][0]
     assert first_result["tool_use_id"] == "toolu_1"
     assert "xxxx" in first_result["content"]
+
+
+def test_compressor_settings_reach_the_request(conn):
+    config = AgentConfig(
+        context_trigger_tokens=50_000, context_keep_tool_uses=3, context_clear_at_least_tokens=0,
+        context_protected_tools=["describe_table", "sample_rows"],
+    )
+    client = FakeClient(response("end_turn", text("ok")))
+    run_agent(conn, "q", client=client, config=config)
+    (edit,) = client.last_kwargs["context_management"]["edits"]
+    assert edit["trigger"]["value"] == 50_000
+    assert edit["keep"]["value"] == 3
+    assert edit["clear_at_least"]["value"] == 0
+    assert edit["exclude_tools"] == ["describe_table", "sample_rows"]
+
+
+def test_default_compressor_settings_are_the_documented_constant():
+    assert AgentConfig().context_management() == CONTEXT_MANAGEMENT
+
+
+@pytest.mark.parametrize("settings, message", [
+    ({"context_trigger_tokens": 0}, "context_trigger_tokens"),
+    ({"context_keep_tool_uses": -1}, "context_keep_tool_uses"),
+    ({"context_clear_at_least_tokens": 1.5}, "context_clear_at_least_tokens"),
+    ({"context_protected_tools": "list_tables"}, "list of tool names"),
+    ({"context_protected_tools": ["list_tables", "run_sql"]}, "unknown tools: run_sql"),
+])
+def test_bad_compressor_settings_are_rejected(settings, message):
+    with pytest.raises(ValueError, match=message):
+        AgentConfig(**settings)
+
+
+def test_protected_tools_from_json_are_stored_as_a_tuple_and_recorded_as_a_list():
+    config = AgentConfig(context_protected_tools=["list_tables", "list_tables", "describe_table"])
+    assert config.context_protected_tools == ("list_tables", "describe_table")
+    assert config.to_dict()["context_protected_tools"] == ["list_tables", "describe_table"]
+    hash(config)  # still usable as a key
+
+
+def test_tool_names_match_the_tools():
+    from duckdb_agent.config import TOOL_NAMES
+    from duckdb_agent.tools import SUBMIT_ANSWER_TOOL
+    assert set(TOOL_NAMES) == {tool["name"] for tool in TOOLS} | {SUBMIT_ANSWER_TOOL["name"]}
