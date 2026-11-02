@@ -51,9 +51,9 @@ def db(tmp_path):
     return path
 
 
-def server(client=None, traces=None):
+def server(client=None, traces=None, traces_path=None):
     out = Output()
-    return Server(None, out, client=client or FakeClient(), traces=traces), out
+    return Server(None, out, client=client or FakeClient(), traces=traces, traces_path=traces_path), out
 
 
 def test_hello_reports_protocol_and_defaults():
@@ -245,3 +245,50 @@ def test_compressor_settings_arrive_through_the_protocol(db):
     assert out.of("r")[-1]["type"] == "result"
     (edit,) = client.last_kwargs["context_management"]["edits"]
     assert edit["trigger"]["value"] == 40_000 and edit["exclude_tools"] == ["describe_table"]
+
+
+def test_traces_request_reports_where_traces_go(tmp_path):
+    traces_path = str(tmp_path / "traces.duckdb")
+    srv, out = server(traces_path=traces_path)
+    srv.handle({"id": "t", "type": "traces"})
+    reply = out.of("t")[0]
+    assert reply["type"] == "traces"
+    assert reply["enabled"] is True and reply["db"] == traces_path
+    assert reply["exists"] is False and reply["server"]["running"] is False
+    init_traces_db(traces_path).close()
+    srv.handle({"id": "t2", "type": "traces"})
+    reply = out.of("t2")[0]
+    assert reply["exists"] is True and reply["size_bytes"] > 0
+    assert "token" not in json.dumps(reply)
+
+
+def test_traces_off():
+    srv, out = server()
+    srv.handle({"id": "t", "type": "traces"})
+    assert out.of("t")[0]["enabled"] is False
+    srv.handle({"id": "r", "type": "traces_reset"})
+    assert out.of("r")[0] == {"id": "r", "type": "error", "error": "traces are off"}
+
+
+def test_traces_reset_deletes_the_database(tmp_path):
+    traces_path = str(tmp_path / "traces.duckdb")
+    init_traces_db(traces_path).close()
+    srv, out = server(traces_path=traces_path)
+    srv.handle({"id": "r", "type": "traces_reset"})
+    assert out.of("r")[0] == {"id": "r", "type": "ok", "deleted": True}
+    assert not (tmp_path / "traces.duckdb").exists()
+    srv.handle({"id": "s", "type": "traces_stop"})
+    assert out.of("s")[0] == {"id": "s", "type": "ok", "stopped": False}
+
+
+def test_traces_reset_waits_for_runs(db, tmp_path):
+    traces_path = str(tmp_path / "traces.duckdb")
+    init_traces_db(traces_path).close()
+    srv, out = server(FakeClient(response("tool_use", tool_use(SLOW_SQL))), traces_path=traces_path)
+    srv.handle({"id": "r1", "type": "run", "prompt": "slow", "source": {"db": db}, "config": {"query_timeout_seconds": 60}})
+    out.wait_for(lambda m: m.get("event") == "tool_call_start")
+    srv.handle({"id": "x", "type": "traces_reset"})
+    assert out.of("x")[0]["type"] == "error" and "still going" in out.of("x")[0]["error"]
+    assert (tmp_path / "traces.duckdb").exists()
+    srv.handle({"id": "s", "type": "stop", "run": "r1"})
+    srv.wait_all()

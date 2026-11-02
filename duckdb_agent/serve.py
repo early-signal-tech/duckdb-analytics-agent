@@ -21,7 +21,14 @@ Requests:
            EventCallback in loop.py)
         -> {"id": "r1", "type": "result", "result": {...AgentResult fields}}
     {"id": "s", "type": "stop", "run": "r1"}       -> {"id": "s", "type": "ok"}
+    {"id": "t", "type": "traces"}
+        -> {"id": "t", "type": "traces", "enabled": true, "db": "/abs/agent_traces.duckdb",
+            "exists": true, "size_bytes": 123, "server": {"running": true, "uri": "quack:…", "pid": 1}}
+    {"id": "t", "type": "traces_stop"}             -> {"id": "t", "type": "ok", "stopped": true}
+    {"id": "t", "type": "traces_reset"}            -> {"id": "t", "type": "ok", "deleted": true}
     {"id": "q", "type": "shutdown"}                -> {"id": "q", "type": "ok"}, then exit
+traces_stop stops the background traces server (the next run starts it again);
+traces_reset deletes the traces database. Both are refused while runs are active.
 "preset" and "labels" are optional and don't change the run; they're recorded with it in
 agent_runs (see run_agent). A bad request gets {"id": ..., "type": "error", "error": "..."}; a run that fails before
 it starts (a missing file, a bad db path) gets the same in place of its result.
@@ -34,6 +41,7 @@ built on first use and kept for later runs. End of input stops all runs and exit
 import argparse
 import dataclasses
 import json
+import os
 import sys
 import threading
 
@@ -46,7 +54,8 @@ from .log import configure_logging, logger
 from .loop import run_agent
 from .serialization import json_dumps
 from .sources import IN_MEMORY, connect, use_statement
-from .traces_server import DEFAULT_PORT, connect_traces_db
+from .traces_server import DEFAULT_PORT, connect_traces_db, server_status, stop_traces_server
+from .tracing import reset_traces_db
 from .usage import MODEL_PRICING
 
 
@@ -152,14 +161,16 @@ def parse_labels(labels) -> dict | None:
 
 class Server:
     """The request loop. `client` and `traces` are injectable for tests: `traces` is a
-    zero-argument function returning a TracesDB for one run (or None for no traces)."""
+    zero-argument function returning a TracesDB for one run (or None for no traces).
+    `traces_path` is the traces database file, for the traces requests (None: traces off)."""
 
-    def __init__(self, stdin, stdout, client=None, traces=None):
+    def __init__(self, stdin, stdout, client=None, traces=None, traces_path=None):
         self.stdin = stdin
         self.stdout = stdout
         self._client = client
         self._client_lock = threading.Lock()
         self.traces = traces or (lambda: None)
+        self.traces_path = os.path.abspath(traces_path) if traces_path else None
         self._write_lock = threading.Lock()
         self._sources = {}  # source key -> open base connection
         self._sources_lock = threading.Lock()
@@ -233,6 +244,8 @@ class Server:
             else:
                 run["cancel"].set()
                 self.send({"id": request_id, "type": "ok"})
+        elif kind in ("traces", "traces_stop", "traces_reset"):
+            self.handle_traces(request_id, kind)
         elif kind == "shutdown":
             self.stop_all()
             self.send({"id": request_id, "type": "ok"})
@@ -240,6 +253,45 @@ class Server:
         else:
             self.send_error(request_id, f"unknown request type {kind!r}")
         return True
+
+    def traces_info(self) -> dict:
+        """Where traces go, and whether the background traces server is up (no token)."""
+        path = self.traces_path
+        if path is None:
+            return {"enabled": False, "db": None, "exists": False, "size_bytes": None, "server": None}
+        exists = os.path.exists(path)
+        state = server_status(path) if exists else None
+        return {
+            "enabled": True,
+            "db": path,
+            "exists": exists,
+            "size_bytes": os.path.getsize(path) if exists else None,
+            "server": {
+                "running": state is not None,
+                "uri": state.get("uri") if state else None,
+                "pid": state.get("pid") if state else None,
+            },
+        }
+
+    def handle_traces(self, request_id: str, kind: str) -> None:
+        if kind == "traces":
+            self.send({"id": request_id, "type": "traces", **self.traces_info()})
+            return
+        if self.traces_path is None:
+            self.send_error(request_id, "traces are off")
+            return
+        with self._runs_lock:
+            active = len(self._runs)
+        if active:
+            self.send_error(request_id, f"{active} run(s) still going; stop them first")
+            return
+        try:
+            if kind == "traces_stop":
+                self.send({"id": request_id, "type": "ok", "stopped": stop_traces_server(self.traces_path)})
+            else:
+                self.send({"id": request_id, "type": "ok", "deleted": reset_traces_db(self.traces_path)})
+        except OSError as e:
+            self.send_error(request_id, f"{type(e).__name__}: {e}")
 
     def start_run(self, request: dict) -> None:
         request_id = request["id"]
@@ -351,7 +403,8 @@ def main(argv=None) -> int:
     if not args.no_traces:
         def traces():
             return connect_traces_db(args.traces_db, server=not args.no_traces_server, port=args.traces_port)
-    Server(sys.stdin, sys.stdout, traces=traces).serve_forever()
+    traces_path = None if args.no_traces else args.traces_db
+    Server(sys.stdin, sys.stdout, traces=traces, traces_path=traces_path).serve_forever()
     return 0
 
 
