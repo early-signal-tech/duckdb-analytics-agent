@@ -114,30 +114,51 @@ def execute_query(
     max_chars: int = MAX_RESULT_CHARS,
     max_cell_chars: int = MAX_CELL_CHARS,
     timeout_seconds: float | None = QUERY_TIMEOUT_SECONDS,
-    params: list | None = None
+    params: list | None = None,
+    cancel: threading.Event | None = None
 ) -> dict:
-    """Execute SQL and return a size-capped result as dict. Pass timeout_seconds=None to disable."""
+    """Execute SQL and return a size-capped result as dict. Pass timeout_seconds=None to disable.
+
+    `cancel` stops a run from outside (the app's STOP button): when it is set, a running
+    query is interrupted and reported with error_type "cancelled".
+    """
     read_only_error = check_read_only_sql(conn, sql)
     if read_only_error:
         error_type = "sql_parse_error" if read_only_error.startswith("SQL parse error") else "read_only_violation"
         return tool_error(read_only_error, error_type)
 
-    # Cancel queries that run too long. The lock and `done` flag make sure a timer
-    # firing just as the query finishes can't interrupt a later query on this connection.
-    lock = threading.Lock()
-    state = {"done": False, "timed_out": False}
+    if cancel is not None and cancel.is_set():
+        return tool_error("The run was stopped before this query ran.", "cancelled", cancelled=True)
 
-    def interrupt():
+    # Cancel queries that run too long, or when the run is stopped. The lock and `done`
+    # flag make sure an interrupt arriving just as the query finishes can't hit a later
+    # query on this connection.
+    lock = threading.Lock()
+    state = {"done": False, "reason": None}
+    finished = threading.Event()
+
+    def interrupt(reason: str):
         with lock:
-            if not state["done"]:
-                state["timed_out"] = True
+            if not state["done"] and state["reason"] is None:
+                state["reason"] = reason
                 conn.interrupt()
 
     timer = None
     if timeout_seconds:
-        timer = threading.Timer(timeout_seconds, interrupt)
+        timer = threading.Timer(timeout_seconds, lambda: interrupt("timeout"))
         timer.daemon = True
         timer.start()
+
+    watcher = None
+    if cancel is not None:
+        def watch():
+            # Polls, since a thread can't wait on two Events at once.
+            while not finished.wait(0.05):
+                if cancel.is_set():
+                    interrupt("cancelled")
+                    return
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
 
     try:
         try:
@@ -147,11 +168,14 @@ def execute_query(
         finally:
             with lock:
                 state["done"] = True
+            finished.set()
             if timer:
                 timer.cancel()
         return cap_result_size(columns, rows, max_rows, max_chars, max_cell_chars)
     except duckdb.InterruptException:
-        if not state["timed_out"]:
+        if state["reason"] == "cancelled":
+            return tool_error("The run was stopped while this query ran.", "cancelled", cancelled=True)
+        if state["reason"] != "timeout":
             raise  # interrupted by someone else (e.g. Ctrl-C), not our timeout
         return tool_error(
             f"Query timed out after {timeout_seconds}s and was cancelled. "

@@ -3,8 +3,10 @@
 import anthropic
 import duckdb
 import logging
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -18,7 +20,32 @@ from .tools import (
     tool_result_block, validate_answer,
 )
 from .tracing import TracesDB, describe_source, log_api_call, log_run_summary, log_tool_call, log_trace
-from .usage import MODEL_PRICING, add_usage, estimate_cost
+from .usage import MODEL_PRICING, USAGE_FIELDS, add_usage, estimate_cost
+
+
+# Live progress for a UI. run_agent(on_event=...) calls the callback with one dict per
+# event: {"event": <name>, "run_id": ..., **fields}. Every value is JSON-ready. Events:
+#   run_start        model, effort, tables, prompt, config (AgentConfig.to_dict())
+#   api_call_start   iteration
+#   api_call         iteration, latency_ms, stop_reason, request_id, usage (this call),
+#                    cost_usd (this call), context_tokens (prompt size of this call:
+#                    input + cache write + cache read), total_usage, total_cost_usd
+#   api_error        iteration, error, retryable
+#   context_edit     iteration, details (the API's applied edit: cleared tokens / tool uses)
+#   thinking         iteration, text (summarized thinking)
+#   tool_call_start  iteration, tool (API name, e.g. query_database), label (display
+#                    name), tool_use_id, input
+#   tool_call        iteration, tool, label, tool_use_id, success, row_count, truncated,
+#                    error_type, duration_ms, result_chars, tables
+#   run_end          the AgentResult fields: status, text, iterations, stop_reason, error,
+#                    retryable, answer, usage, estimated_cost_usd, api_calls, duration_ms
+# Callback errors are logged and ignored: a broken UI never stops a run.
+EventCallback = Callable[[dict], None]
+
+
+def usage_dict(usage) -> dict:
+    """One response's usage as plain ints (cache fields are None when unused)."""
+    return {name: getattr(usage, name, None) or 0 for name in USAGE_FIELDS}
 
 
 @dataclass
@@ -26,7 +53,8 @@ class AgentResult:
     """Outcome of an agent run. `status` says how the run ended, not just what was said."""
     run_id: str
     # completed | max_tokens | refusal | context_window_exceeded | unexpected_stop
-    # | max_iterations | api_error | error | interrupted
+    # | max_iterations | api_error | error | interrupted | cancelled
+    # cancelled: stopped through run_agent's `cancel` event; `text` is empty.
     # max_iterations: `text` is Claude's best answer from partial work, made with tools disabled.
     status: str
     text: str
@@ -91,7 +119,9 @@ def run_agent(
     tables: str | list[str] | None = None,
     config: AgentConfig = DEFAULT_CONFIG,
     traces_conn: TracesDB = None,
-    client: anthropic.Anthropic = None
+    client: anthropic.Anthropic = None,
+    on_event: EventCallback | None = None,
+    cancel: threading.Event | None = None
 ) -> AgentResult:
     """Run the SQL-to-LLM agent loop.
 
@@ -101,6 +131,11 @@ def run_agent(
     `tables` names the tables to focus on; their schemas are put in the first message
     to save a round trip. Claude can still find and use any table in the current
     database. With no tables, it starts from list_tables.
+
+    `on_event` receives live progress (see EventCallback) for a UI. Setting `cancel`
+    (a threading.Event, from any thread) stops the run with status "cancelled": a
+    running query is interrupted at once; an API call in flight finishes first, and
+    its tool calls are not run.
 
     API failures end the run with status "api_error" instead of raising. Any other
     exception (a bug, Ctrl-C) is re-raised, but the run summary is written first.
@@ -121,6 +156,14 @@ def run_agent(
         "cost": 0.0 if config.model in MODEL_PRICING else None,
         "last_query_tables": None,  # tables of the last successful query, for answer_tables
     }
+
+    def emit(name: str, **data) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event({"event": name, "run_id": run_id, **data})
+        except Exception:
+            logger.warning("on_event callback failed for %s event", name, exc_info=True)
 
     def finish(
         status: str,
@@ -177,19 +220,29 @@ def run_agent(
                 estimated_cost_usd=cost
             )
         summary_written = True
-        return AgentResult(
+        result = AgentResult(
             run_id, status, text, iterations, stop_reason, error, retryable, answer,
             dict(progress["usage"]), cost, progress["api_calls"], duration_ms
         )
+        emit(
+            "run_end", status=status, text=text, iterations=iterations, stop_reason=stop_reason,
+            error=error, retryable=retryable, answer=answer, usage=result.usage,
+            estimated_cost_usd=cost, api_calls=result.api_calls, duration_ms=duration_ms
+        )
+        return result
 
     try:
+        emit("run_start", model=config.model, effort=config.effort, tables=tables, prompt=prompt,
+             config=config.to_dict())
         if traces_conn:
             # Logged first, so readers can see a run in progress (agent_runs is written
             # at the end) and replay its SQL against the right database.
             log_trace(traces_conn, run_id, 0, "run_start", details={
                 **source, "model": config.model, "tables": tables, "prompt": prompt
             })
-        return _run_agent_loop(conn, tables, prompt, config, traces_conn, client, run_id, finish, progress)
+        return _run_agent_loop(
+            conn, tables, prompt, config, traces_conn, client, run_id, finish, progress, emit, cancel
+        )
     except BaseException as e:
         if not summary_written:
             status = "interrupted" if isinstance(e, KeyboardInterrupt) else "error"
@@ -210,7 +263,9 @@ def _run_agent_loop(
     client: anthropic.Anthropic,
     run_id: str,
     finish,
-    progress: dict
+    progress: dict,
+    emit,
+    cancel: threading.Event | None
 ) -> AgentResult:
     logger.info("\n%s\nStarting agent loop (Run ID: %s, model: %s, effort: %s)\n%s",
                 "=" * 60, run_id, config.model, config.effort, "=" * 60)
@@ -264,11 +319,21 @@ def _run_agent_loop(
         }
     ]
 
+    def cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
+
+    def finish_cancelled(iteration: int) -> AgentResult:
+        logger.warning("\n[Cancelled] Run stopped at iteration %s", iteration)
+        if traces_conn:
+            log_trace(traces_conn, run_id, iteration, "cancelled")
+        return finish("cancelled", "", iteration)
+
     def call_claude(iteration: int, **extra):
         """Call the API. Returns (response, None), or (None, AgentResult) if the call failed."""
         progress["iteration"] = iteration
         progress["api_calls"] += 1
         logger.info("\n[Iteration %s] Calling Claude...", iteration)
+        emit("api_call_start", iteration=iteration)
         # Latency covers the SDK's own retries and backoff, i.e. what the run waited.
         call_started_at, call_clock = datetime.now(), time.monotonic()
         try:
@@ -295,7 +360,9 @@ def _run_agent_loop(
                     traces_conn, run_id, iteration, call_started_at, latency_ms, config.model,
                     request_id=getattr(e, "request_id", None), error=error
                 )
-            return None, finish("api_error", "", iteration, error=error, retryable=is_retryable_api_error(e))
+            retryable = is_retryable_api_error(e)
+            emit("api_error", iteration=iteration, error=error, retryable=retryable)
+            return None, finish("api_error", "", iteration, error=error, retryable=retryable)
         latency_ms = round((time.monotonic() - call_clock) * 1000)
         # The SDK sets _request_id from the response's request-id header.
         request_id = getattr(response, "_request_id", None)
@@ -325,14 +392,25 @@ def _run_agent_loop(
                 usage=usage,
                 estimated_cost_usd=cost
             )
+        call_usage = usage_dict(usage) if usage is not None else {}
+        emit(
+            "api_call", iteration=iteration, latency_ms=latency_ms, stop_reason=response.stop_reason,
+            request_id=request_id, usage=call_usage, cost_usd=cost,
+            context_tokens=sum(call_usage.get(name, 0) for name in (
+                "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"
+            )),
+            total_usage=dict(progress["usage"]), total_cost_usd=progress["cost"]
+        )
         context_management = getattr(response, "context_management", None)
         for edit in getattr(context_management, "applied_edits", None) or []:
             details = edit.model_dump() if hasattr(edit, "model_dump") else vars(edit)
             logger.info("  context edit: %s", details)
+            emit("context_edit", iteration=iteration, details=details)
             if traces_conn:
                 log_trace(traces_conn, run_id, iteration, "context_edit", details=details)
         thinking = response_thinking(response)
         if thinking:
+            emit("thinking", iteration=iteration, text=thinking)
             first_line = thinking.strip().splitlines()[0]
             logger.debug("  thinking: %s%s", first_line[:100], "..." if len(thinking) > len(first_line[:100]) else "")
             if traces_conn:
@@ -369,9 +447,13 @@ def _run_agent_loop(
         return finish(status, text_response, iteration, stop_reason)
 
     for iteration in range(1, config.max_iterations + 1):
+        if cancelled():
+            return finish_cancelled(iteration - 1)
         response, failed = call_claude(iteration)
         if failed:
             return failed
+        if cancelled():
+            return finish_cancelled(iteration)
 
         if response.stop_reason == "pause_turn":
             # Server paused its own sampling loop; resend the turn as-is to resume.
@@ -407,12 +489,16 @@ def _run_agent_loop(
 
         tool_results = []
         for block in tool_uses:
+            if cancelled():
+                return finish_cancelled(iteration)
             tool_name = TOOL_LABELS.get(block.name, block.name)
             # Every tool's input is logged as tool_input; query_database's SQL also goes
             # in its own column, as plain text ready to copy and run.
             sql = block.input.get("sql") if block.name == "query_database" else None
             logger.info("  Tool: %s (%s)", tool_name, block.id)
             logger.debug("  Input: %s...", (sql or json_dumps(block.input))[:80])
+            emit("tool_call_start", iteration=iteration, tool=block.name, label=tool_name, tool_use_id=block.id,
+                 input=block.input)
             tool_started_at, tool_clock = datetime.now(), time.monotonic()
             if config.structured_answer and block.name == "submit_answer":
                 if len(tool_uses) == 1:
@@ -425,7 +511,7 @@ def _run_agent_loop(
                         "submit_not_alone"
                     )
             else:
-                result = run_tool(conn, block.name, block.input, config)
+                result = run_tool(conn, block.name, block.input, config, cancel=cancel)
             duration_ms = round((time.monotonic() - tool_clock) * 1000)
             result_block = tool_result_block(block.id, result)
             result_chars = len(result_block["content"])
@@ -440,10 +526,17 @@ def _run_agent_loop(
                 logger.debug("  Error message: %s", result["error"])
             tool_results.append(result_block)
 
+            table_names = tables_touched(conn, block.name, block.input, result)
+            if block.name == "query_database" and result["success"] and table_names is not None:
+                progress["last_query_tables"] = table_names
+            emit(
+                "tool_call", iteration=iteration, tool=block.name, label=tool_name, tool_use_id=block.id,
+                success=result["success"], row_count=row_count, truncated=bool(result.get("truncated")),
+                error_type=result.get("error_type"), duration_ms=duration_ms, result_chars=result_chars,
+                tables=table_names
+            )
+
             if traces_conn:
-                table_names = tables_touched(conn, block.name, block.input, result)
-                if block.name == "query_database" and result["success"] and table_names is not None:
-                    progress["last_query_tables"] = table_names
                 log_trace(
                     traces_conn,
                     run_id,
@@ -487,6 +580,8 @@ def _run_agent_loop(
     messages.append({"role": "system", "content": MAX_ITERATIONS_WRAP_UP_PROMPT})
 
     wrap_up_iteration = config.max_iterations + 1
+    if cancelled():
+        return finish_cancelled(config.max_iterations)
     # Changing tool_choice keeps the tools + system cache but invalidates the
     # conversation cache, so this one call re-writes the history. It happens once per run.
     response, failed = call_claude(wrap_up_iteration, tool_choice={"type": "none"})
