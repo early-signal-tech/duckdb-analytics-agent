@@ -124,7 +124,8 @@ def run_agent(
     on_event: EventCallback | None = None,
     cancel: threading.Event | None = None,
     preset: dict | None = None,
-    labels: dict | None = None
+    labels: dict | None = None,
+    source_db: str | None = None
 ) -> AgentResult:
     """Run the SQL-to-LLM agent loop.
 
@@ -146,6 +147,10 @@ def run_agent(
     {"id": ..., "name": "Balanced", "revision": 3, "modified": False}; `labels` is any
     small dict of the caller's own tags, e.g. {"setlist": "tpch", "question": "Q3"}.
 
+    `source_db` is the database as the caller attached it (a file path or ducklake:
+    URI). It's recorded as agent_runs.source_db when DuckDB can't report the path
+    itself, as with a DuckLake attached through a secret (ducklake:ducklake_prod).
+
     API failures end the run with status "api_error" instead of raising. Any other
     exception (a bug, Ctrl-C) is re-raised, but the run summary is written first.
     """
@@ -156,6 +161,8 @@ def run_agent(
     tables = [tables] if isinstance(tables, str) else list(tables or [])
     table_name = ", ".join(tables) or None  # for the agent_runs trace
     source = describe_source(conn)  # what database the SQL runs against, for replaying it
+    if not source["source_db"] and source_db:
+        source["source_db"] = source_db
     started_at, start_clock = datetime.now(), time.monotonic()
     # Shared with the loop. cost stays None for models without pricing.
     progress = {

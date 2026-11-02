@@ -13,6 +13,12 @@ READ_ONLY_ERROR = (
     "(SELECT/WITH/FROM/DESCRIBE/SHOW/SUMMARIZE, or EXPLAIN of one)."
 )
 
+# Several read-only queries in one call: not a write attempt, so its own error class
+# (multiple_statements), and a message that says what to do instead.
+MULTIPLE_STATEMENTS_ERROR = (
+    "Send one query per call: this has {n} statements. Run them one at a time."
+)
+
 
 # EXPLAIN [ANALYZE] [(options)] <statement> -- ANALYZE executes the inner statement.
 EXPLAIN_PREFIX = re.compile(r"^\s*explain\s+(?:analyze\s+)?(?:\([^)]*\)\s*)?", re.IGNORECASE)
@@ -30,8 +36,12 @@ def check_read_only_sql(conn: duckdb.DuckDBPyConnection, sql: str) -> str | None
     except duckdb.Error as e:
         return f"SQL parse error: {e}"
 
-    # DuckDB executes every statement in a batch, so reject stacked SQL.
+    # DuckDB executes every statement in a batch, so reject stacked SQL. If every
+    # statement is a read, say so (multiple_statements); a batch with a write in it is
+    # still a read-only violation.
     if len(statements) != 1:
+        if statements and all(s.type == duckdb.StatementType.SELECT for s in statements):
+            return MULTIPLE_STATEMENTS_ERROR.format(n=len(statements))
         return READ_ONLY_ERROR
 
     statement_type = statements[0].type
@@ -102,7 +112,7 @@ def cap_result_size(
 
 def tool_error(message: str, error_type: str, **extra) -> dict:
     """A failed tool result. `error` is what Claude sees; `error_type` is a stable class
-    for traces (tool_calls.error_type), e.g. timeout, read_only_violation, table_not_found,
+    for traces (tool_calls.error_type), e.g. timeout, read_only_violation, multiple_statements, table_not_found,
     or a DuckDB exception name such as BinderException."""
     return {"success": False, "error": message, "error_type": error_type, **extra}
 
@@ -124,7 +134,12 @@ def execute_query(
     """
     read_only_error = check_read_only_sql(conn, sql)
     if read_only_error:
-        error_type = "sql_parse_error" if read_only_error.startswith("SQL parse error") else "read_only_violation"
+        if read_only_error.startswith("SQL parse error"):
+            error_type = "sql_parse_error"
+        elif read_only_error.startswith("Send one query per call"):
+            error_type = "multiple_statements"
+        else:
+            error_type = "read_only_violation"
         return tool_error(read_only_error, error_type)
 
     if cancel is not None and cancel.is_set():
