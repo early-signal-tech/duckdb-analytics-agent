@@ -25,7 +25,8 @@ from .usage import MODEL_PRICING, USAGE_FIELDS, add_usage, estimate_cost
 
 # Live progress for a UI. run_agent(on_event=...) calls the callback with one dict per
 # event: {"event": <name>, "run_id": ..., **fields}. Every value is JSON-ready. Events:
-#   run_start        model, effort, tables, prompt, config (AgentConfig.to_dict())
+#   run_start        model, effort, tables, prompt, config (AgentConfig.to_dict()),
+#                    preset, labels (as passed to run_agent; None when not given)
 #   api_call_start   iteration
 #   api_call         iteration, latency_ms, stop_reason, request_id, usage (this call),
 #                    cost_usd (this call), context_tokens (prompt size of this call:
@@ -121,7 +122,9 @@ def run_agent(
     traces_conn: TracesDB = None,
     client: anthropic.Anthropic = None,
     on_event: EventCallback | None = None,
-    cancel: threading.Event | None = None
+    cancel: threading.Event | None = None,
+    preset: dict | None = None,
+    labels: dict | None = None
 ) -> AgentResult:
     """Run the SQL-to-LLM agent loop.
 
@@ -136,6 +139,12 @@ def run_agent(
     (a threading.Event, from any thread) stops the run with status "cancelled": a
     running query is interrupted at once; an API call in flight finishes first, and
     its tool calls are not run.
+
+    `preset` and `labels` don't change how the run behaves; they're recorded with it
+    (agent_runs.preset / .labels, and the run_start event) so runs can be grouped later.
+    `preset` describes the saved settings the caller started from, e.g.
+    {"id": ..., "name": "Balanced", "revision": 3, "modified": False}; `labels` is any
+    small dict of the caller's own tags, e.g. {"setlist": "tpch", "question": "Q3"}.
 
     API failures end the run with status "api_error" instead of raising. Any other
     exception (a bug, Ctrl-C) is re-raised, but the run summary is written first.
@@ -210,6 +219,8 @@ def run_agent(
                 error=error,
                 model=config.model,
                 config=config.to_dict(),
+                preset=preset,
+                labels=labels,
                 source=source,
                 answer_tables=answer_tables,
                 answer_tables_from=answer_tables_from,
@@ -233,7 +244,7 @@ def run_agent(
 
     try:
         emit("run_start", model=config.model, effort=config.effort, tables=tables, prompt=prompt,
-             config=config.to_dict())
+             config=config.to_dict(), preset=preset, labels=labels)
         if traces_conn:
             # Logged first, so readers can see a run in progress (agent_runs is written
             # at the end) and replay its SQL against the right database.

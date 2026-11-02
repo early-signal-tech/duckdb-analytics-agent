@@ -38,6 +38,12 @@ TRACES_TABLES = {
         # (system prompt as a hash), so runs can be compared by configuration: config.effort.
         "model": "VARCHAR",
         "config": "VARIANT",
+        # Where the settings came from, as the caller (e.g. the DH-1 app) reports it:
+        # preset is {id, name, revision, modified} (modified: knobs were changed after
+        # loading it), NULL when no preset was used. labels are the caller's own tags
+        # for grouping runs (a setlist, a question, a repeat), NULL when there are none.
+        "preset": "VARIANT",
+        "labels": "VARIANT",
         # The database the agent's SQL ran against (see describe_source).
         "source_db": "VARCHAR",
         "source_catalog": "VARCHAR",
@@ -445,6 +451,8 @@ def log_run_summary(
     error: str = None,
     model: str = None,
     config: dict = None,
+    preset: dict = None,
+    labels: dict = None,
     source: dict = None,
     answer_tables: list[str] = None,
     answer_tables_from: str = None,
@@ -471,6 +479,8 @@ def log_run_summary(
         "error": error,
         "model": model,
         "config": config,
+        "preset": preset,
+        "labels": labels,
         "source_db": source.get("source_db"),
         "source_catalog": source.get("source_catalog"),
         "source_schema": source.get("source_schema"),

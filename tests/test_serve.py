@@ -179,3 +179,49 @@ def test_subprocess_speaks_only_json_on_stdout():
     assert proc.returncode == 0, proc.stderr
     replies = [json.loads(line) for line in proc.stdout.splitlines()]
     assert [(r["id"], r["type"]) for r in replies] == [("h", "hello"), ("x", "error"), ("q", "ok")]
+
+
+def test_preset_and_labels_are_recorded_with_the_run(db, tmp_path):
+    traces_path = str(tmp_path / "traces.duckdb")
+    srv, out = server(FakeClient(response("end_turn", text("3"))), traces=lambda: init_traces_db(traces_path))
+    preset = {"id": "p-1", "name": "Balanced", "revision": 3, "modified": True}
+    srv.handle({
+        "id": "r1", "type": "run", "prompt": "How many?", "source": {"db": db},
+        "preset": preset, "labels": {"setlist": "tpch", "question": "Q3", "repeat": 2},
+    })
+    srv.wait_all()
+    start = next(m for m in out.of("r1") if m.get("event") == "run_start")
+    assert start["preset"] == preset
+    assert start["labels"]["question"] == "Q3"
+    row = duckdb.connect(traces_path).execute("""
+        SELECT preset.name::VARCHAR, preset.revision::INTEGER, preset.modified::BOOLEAN,
+               labels.question::VARCHAR, labels.repeat::INTEGER
+        FROM agent_runs
+    """).fetchone()
+    assert row == ("Balanced", 3, True, "Q3", 2)
+
+
+def test_runs_without_a_preset_record_null(db, tmp_path):
+    traces_path = str(tmp_path / "traces.duckdb")
+    srv, _ = server(FakeClient(response("end_turn", text("3"))), traces=lambda: init_traces_db(traces_path))
+    srv.handle({"id": "r1", "type": "run", "prompt": "q", "source": {"db": db}})
+    srv.wait_all()
+    assert duckdb.connect(traces_path).execute("SELECT preset, labels FROM agent_runs").fetchone() == (None, None)
+
+
+@pytest.mark.parametrize("fields, message", [
+    ({"preset": "Balanced"}, '"preset" must be an object'),
+    ({"preset": {"revision": 1}}, 'needs a "name"'),
+    ({"preset": {"name": "B", "colour": "red"}}, "unknown preset fields: colour"),
+    ({"preset": {"name": "B", "revision": "3"}}, 'preset "revision" must be a int'),
+    ({"preset": {"name": "B", "revision": True}}, 'preset "revision" must be a int'),
+    ({"labels": ["Q3"]}, '"labels" must be an object'),
+    ({"labels": {"q": {"nested": 1}}}, 'label "q" must be a string'),
+    ({"labels": {f"k{i}": i for i in range(21)}}, "at most 20"),
+])
+def test_bad_preset_or_labels_get_an_error(db, fields, message):
+    srv, out = server()
+    srv.handle({"id": "r", "type": "run", "prompt": "q", "source": {"db": db}, **fields})
+    (reply,) = out.messages
+    assert reply["type"] == "error"
+    assert message in reply["error"]

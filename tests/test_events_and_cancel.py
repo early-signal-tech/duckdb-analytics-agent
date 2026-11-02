@@ -166,3 +166,11 @@ def test_query_skipped_when_already_cancelled(conn):
 def test_timeout_still_reported_as_timeout_with_cancel_watching(conn):
     result = execute_query(conn, SLOW_SQL, timeout_seconds=0.3, cancel=threading.Event())
     assert result["error_type"] == "timeout"
+
+
+def test_run_start_carries_preset_and_labels(conn):
+    events = []
+    run_agent(conn, "q", client=FakeClient(response("end_turn", text("x"))), on_event=events.append,
+              preset={"name": "Quick", "revision": 1}, labels={"question": "Q1"})
+    assert events[0]["preset"] == {"name": "Quick", "revision": 1}
+    assert events[0]["labels"] == {"question": "Q1"}

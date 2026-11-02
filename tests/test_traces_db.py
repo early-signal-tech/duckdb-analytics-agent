@@ -229,3 +229,14 @@ def test_server_from_older_code_is_restarted(served):
     assert traces.remote
     assert server_status(path)["pid"] != old_pid
     traces.close()
+
+
+def test_preset_and_labels_columns_are_added_to_an_existing_file(tmp_path):
+    path = str(tmp_path / "traces.duckdb")
+    old = init_traces_db(path)
+    old.execute("ALTER TABLE agent_runs DROP COLUMN preset")
+    old.execute("ALTER TABLE agent_runs DROP COLUMN labels")
+    old.close()
+    traces = init_traces_db(path)
+    columns = dict((row[0], row[1]) for row in traces.execute("DESCRIBE agent_runs").fetchall())
+    assert columns["preset"] == "VARIANT" and columns["labels"] == "VARIANT"

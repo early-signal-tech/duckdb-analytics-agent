@@ -12,14 +12,17 @@ Requests:
             "effort_levels": [...], "priced_models": [...]}
     {"id": "r1", "type": "run", "prompt": "...",
      "source": {"db": "tpch.duckdb", "schema": null} | {"load": ["a.csv"], "tpch": 0.1},
-     "tables": ["orders"], "config": {"effort": "high", "max_iterations": 10, ...}}
+     "tables": ["orders"], "config": {"effort": "high", "max_iterations": 10, ...},
+     "preset": {"id": "…", "name": "Balanced", "revision": 3, "modified": false},
+     "labels": {"setlist": "tpch", "question": "Q3"}}
         -> {"id": "r1", "type": "accepted"}
         -> {"id": "r1", "type": "event", "event": "<name>", "run_id": ..., ...}  (many; see
            EventCallback in loop.py)
         -> {"id": "r1", "type": "result", "result": {...AgentResult fields}}
     {"id": "s", "type": "stop", "run": "r1"}       -> {"id": "s", "type": "ok"}
     {"id": "q", "type": "shutdown"}                -> {"id": "q", "type": "ok"}, then exit
-A bad request gets {"id": ..., "type": "error", "error": "..."}; a run that fails before
+"preset" and "labels" are optional and don't change the run; they're recorded with it in
+agent_runs (see run_agent). A bad request gets {"id": ..., "type": "error", "error": "..."}; a run that fails before
 it starts (a missing file, a bad db path) gets the same in place of its result.
 
 Runs execute in parallel threads (for A/B), each on its own DuckDB connection. Data is
@@ -100,6 +103,50 @@ def parse_config(config) -> AgentConfig:
         return AgentConfig(**config)
     except (TypeError, ValueError) as e:
         raise RequestError(f"invalid config: {e}") from None
+
+
+PRESET_FIELDS = {"id": str, "name": str, "revision": int, "modified": bool}
+
+
+MAX_LABELS = 20
+
+
+def parse_preset(preset) -> dict | None:
+    """The run's "preset": which saved settings it started from. Only these fields, so
+    the agent_runs.preset column stays queryable."""
+    if preset is None:
+        return None
+    if not isinstance(preset, dict):
+        raise RequestError('"preset" must be an object like {"name": "Balanced", "revision": 3}')
+    unknown = set(preset) - set(PRESET_FIELDS)
+    if unknown:
+        raise RequestError(f"unknown preset fields: {', '.join(sorted(unknown))}")
+    for name, kind in PRESET_FIELDS.items():
+        value = preset.get(name)
+        # bool is an int in Python; a revision of True is a mistake.
+        if value is not None and (not isinstance(value, kind) or (kind is int and isinstance(value, bool))):
+            raise RequestError(f'preset "{name}" must be a {kind.__name__}')
+    if not isinstance(preset.get("name"), str) or not preset["name"].strip():
+        raise RequestError('"preset" needs a "name"')
+    return dict(preset)
+
+
+def parse_labels(labels) -> dict | None:
+    """The run's "labels": the caller's own tags, as a flat object of short values."""
+    if labels is None:
+        return None
+    if not isinstance(labels, dict):
+        raise RequestError('"labels" must be an object of tags, e.g. {"question": "Q3"}')
+    if len(labels) > MAX_LABELS:
+        raise RequestError(f'"labels" can have at most {MAX_LABELS} tags')
+    for key, value in labels.items():
+        if not key or len(key) > 64:
+            raise RequestError("label names must be 1-64 characters")
+        if not isinstance(value, (str, int, float, bool)) and value is not None:
+            raise RequestError(f'label "{key}" must be a string, number, true/false, or null')
+        if isinstance(value, str) and len(value) > 200:
+            raise RequestError(f'label "{key}" is longer than 200 characters')
+    return dict(labels) or None
 
 
 class Server:
@@ -200,6 +247,7 @@ class Server:
             tables = request.get("tables")
             if tables is not None and (not isinstance(tables, list) or not all(isinstance(t, str) for t in tables)):
                 raise RequestError('"tables" must be a list of table names')
+            recorded = {"preset": parse_preset(request.get("preset")), "labels": parse_labels(request.get("labels"))}
         except RequestError as e:
             self.send_error(request_id, str(e))
             return
@@ -210,14 +258,14 @@ class Server:
                 self.send_error(request_id, f"a run with id {request_id!r} is already active")
                 return
             thread = threading.Thread(
-                target=self.execute_run, args=(request_id, prompt, source, tables, config, cancel),
+                target=self.execute_run, args=(request_id, prompt, source, tables, config, cancel, recorded),
                 name=f"run-{request_id}", daemon=True
             )
             self._runs[request_id] = {"thread": thread, "cancel": cancel}
         self.send({"id": request_id, "type": "accepted"})
         thread.start()
 
-    def execute_run(self, request_id, prompt, source, tables, config, cancel) -> None:
+    def execute_run(self, request_id, prompt, source, tables, config, cancel, recorded=None) -> None:
         conn = traces_conn = None
         try:
             try:
@@ -231,7 +279,7 @@ class Server:
             result = run_agent(
                 conn, prompt, tables=tables, config=config, traces_conn=traces_conn, client=client,
                 on_event=lambda event: self.send({"id": request_id, "type": "event", **event}),
-                cancel=cancel
+                cancel=cancel, **(recorded or {})
             )
             self.send({"id": request_id, "type": "result", "result": dataclasses.asdict(result)})
         except Exception as e:
