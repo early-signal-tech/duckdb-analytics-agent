@@ -374,6 +374,17 @@ FROM events_rich_ml_gold WHERE event_type = 'purchase' GROUP BY ALL ORDER BY cha
 
 ## 3. Running the evals in batch
 
+**In DH-1:** `evals/analytics-eval.json` is these questions as a Duck Harness question
+set: categories, criteria, reference SQL, and a few trace rules. Open it in DH-1's
+Setlist (Open a set file…, which keeps it under MINE) to run it against several presets,
+and EH-1 will grade the runs. After editing this file, regenerate it and re-import:
+
+```bash
+uv run python scripts/eval_question_set.py --revision 2   # raise the revision each time
+```
+
+**From the command line:**
+
 Save this block as `evals.psv` (id | extra flags | prompt):
 
 ```
