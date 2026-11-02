@@ -16,21 +16,19 @@ normally and 1 otherwise (max iterations, API error, refusal, ...).
 """
 import argparse
 import os
-import re
 import shutil
 import sys
 from pathlib import Path
 
-import duckdb
 from dotenv import load_dotenv
 
 from duckdb_agent import AgentConfig, configure_logging, connect_traces_db, reset_traces_db, run_agent, stop_traces_server
 from duckdb_agent.traces_server import DEFAULT_PORT, TracesServerError, start_traces_server, state_paths
 from duckdb_agent.config import DEFAULT_EFFORT, DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, EFFORT_LEVELS
-
-IN_MEMORY = ":memory:"
-
-DEFAULT_TPCH_SCALE = 0.1  # ~100 MB of data, generated in a few seconds
+# Re-exported: the CLI's data setup lives in the package so the app server can share it.
+from duckdb_agent.sources import (  # noqa: F401
+    DEFAULT_TPCH_SCALE, IN_MEMORY, build_database, connect, populate, table_name_for,
+)
 
 DEFAULT_PROMPT = (
     "Compare the most recent day of data against the prior day and run the most important analysis on it."
@@ -132,58 +130,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         if not args.no_table:
             args.tables = args.tables or ["events_rich_ml_gold"]
     return args
-
-
-def table_name_for(path: str) -> str:
-    """A SQL-safe table name from a file name: data/Sales 2026.csv.gz -> sales_2026."""
-    stem = Path(path).name.split(".")[0]
-    return re.sub(r"\W+", "_", stem).strip("_").lower() or "data"
-
-
-def populate(conn: duckdb.DuckDBPyConnection, load: list[str] = (), tpch: float | None = None) -> None:
-    """Fill a writable database with TPC-H data (`tpch` scale factor) and a table per `load` file."""
-    for path in load:
-        if not Path(path).exists():
-            raise FileNotFoundError(f"--load file not found: {path}")
-    if tpch is not None:
-        conn.execute("INSTALL tpch")
-        conn.execute("LOAD tpch")
-        conn.execute(f"CALL dbgen(sf={float(tpch)})")
-    for path in load:
-        literal = path.replace("'", "''")
-        conn.execute(f'CREATE OR REPLACE TABLE "{table_name_for(path)}" AS SELECT * FROM \'{literal}\'')
-
-
-def build_database(path: str, load: list[str] = (), tpch: float | None = None) -> None:
-    """Create a persistent DuckDB file from `load` files and/or TPC-H data. A failed build
-    leaves no half-written file behind."""
-    conn = duckdb.connect(path)
-    try:
-        populate(conn, load, tpch)
-    except BaseException:
-        conn.close()
-        for leftover in (path, path + ".wal"):
-            Path(leftover).unlink(missing_ok=True)
-        raise
-    conn.close()
-
-
-def connect(db: str, schema: str | None, load: list[str] = (), tpch: float | None = None) -> duckdb.DuckDBPyConnection:
-    """Open the database for the agent.
-
-    A file or ducklake: URI is attached READ_ONLY, so DuckDB rejects writes whatever SQL
-    Claude sends. ":memory:" can't be read-only (it starts empty), so it is populated
-    (see `populate`) and the SQL read-only check is the guard.
-    """
-    conn = duckdb.connect()
-    if db == IN_MEMORY:
-        populate(conn, load, tpch)
-        if schema:
-            conn.execute(f'USE "{schema}"')
-        return conn
-    conn.execute(f"ATTACH '{db.replace(chr(39), chr(39) * 2)}' AS source (READ_ONLY)")
-    conn.execute("USE source" + (f'."{schema}"' if schema else ""))
-    return conn
 
 
 def open_traces_shell(traces_db: str, port: int) -> int:

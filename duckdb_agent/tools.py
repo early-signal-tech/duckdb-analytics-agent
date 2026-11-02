@@ -236,7 +236,8 @@ def describe_table(
     table: str,
     max_rows: int = MAX_RESULT_ROWS,
     max_chars: int = MAX_RESULT_CHARS,
-    max_cell_chars: int = MAX_CELL_CHARS
+    max_cell_chars: int = MAX_CELL_CHARS,
+    cancel=None
 ) -> dict:
     """Columns of a table or view: name, type, nullability, comment."""
     resolved, error = resolve_table(conn, table)
@@ -254,7 +255,8 @@ def describe_table(
         max_rows=max_rows,
         max_chars=max_chars,
         max_cell_chars=max_cell_chars,
-        params=[schema, name]
+        params=[schema, name],
+        cancel=cancel
     )
     if result["success"]:
         result["table"] = f"{schema}.{name}"
@@ -281,10 +283,12 @@ def run_tool(
     conn: duckdb.DuckDBPyConnection,
     name: str,
     tool_input: dict,
-    config: "AgentConfig | None" = None
+    config: "AgentConfig | None" = None,
+    cancel=None
 ) -> dict:
     """Run one of the data tools by name, with the config's result limits and timeout.
-    Never raises for bad input; returns an error result.
+    Never raises for bad input; returns an error result. `cancel` (a threading.Event)
+    interrupts a running query when set; see execute_query.
 
     Strict schemas mean the real API won't send bad input, but this check stays: it
     covers fake clients, proxies that drop `strict`, and future non-strict tools.
@@ -302,6 +306,8 @@ def run_tool(
     if missing:
         return tool_error(f"{name} requires: {', '.join(missing)}", "invalid_input")
 
+    if cancel is not None:
+        limits["cancel"] = cancel
     if name == "list_tables":
         return list_tables(conn, tool_input.get("schema"), **limits)
     if name == "describe_table":

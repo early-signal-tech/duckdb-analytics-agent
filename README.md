@@ -48,6 +48,49 @@ print(result.text)
 
 The library logs through the `duckdb_agent` logger and adds no handlers; call `configure_logging(verbose=True)` for console output in scripts.
 
+### Live progress and stopping a run
+
+Two optional arguments make `run_agent` drivable from a UI:
+
+```python
+import threading
+
+cancel = threading.Event()
+result = run_agent(conn, prompt, on_event=print, cancel=cancel)   # cancel.set() from any thread stops it
+```
+
+- `on_event` gets one JSON-ready dict per step: `run_start`, `api_call_start`, `api_call` (per-call and running token usage, cost, and `context_tokens`, the prompt size), `api_error`, `context_edit`, `thinking`, `tool_call_start`, `tool_call` (outcome, rows, duration, tables), and `run_end` (the `AgentResult` fields). The full list is `EventCallback` in `duckdb_agent/loop.py`. A callback that raises is logged and ignored.
+- `cancel.set()` ends the run with status `cancelled`. A running query is interrupted at once; an API call in flight finishes first, and its tool calls are not run.
+
+## Driving it from another program (the app protocol)
+
+`duckdb_agent.serve` runs the agent behind a JSON Lines protocol on stdin/stdout, for a desktop app or any other front end. Logs go to stderr, so stdout carries only protocol messages.
+
+```bash
+uv run duck-harness-serve                           # traces through the Quack server, as the CLI does
+uv run python -m duckdb_agent.serve                 # the same thing
+uv run python -m duckdb_agent.serve --no-traces     # or: --traces-db PATH, --no-traces-server, --verbose
+```
+
+```jsonc
+// in (one JSON object per line)
+{"id": "h",  "type": "hello"}
+{"id": "r1", "type": "run", "prompt": "Top 5 customers by revenue?",
+ "source": {"db": "tpch.duckdb"}, "tables": ["customer"], "config": {"effort": "high"}}
+{"id": "s",  "type": "stop", "run": "r1"}
+{"id": "q",  "type": "shutdown"}
+
+// out
+{"id": "h",  "type": "hello", "protocol": 1, "defaults": {...}, "effort_levels": [...], "priced_models": [...]}
+{"id": "r1", "type": "accepted"}
+{"id": "r1", "type": "event", "event": "api_call", "run_id": "...", "iteration": 1, ...}
+{"id": "r1", "type": "result", "result": {"status": "completed", "text": "...", ...}}
+```
+
+Another project (the desktop app) can depend on this repo as a package: `uv add git+https://github.com/early-signal-tech/duckdb-analytics-agent`, or `uv add --editable ../duckdb-analytics-agent` to develop both at once. Only `duckdb_agent` is installed, with the `duck-harness-serve` command.
+
+`source` is `{"db": PATH_OR_DUCKLAKE_URI, "schema": ...}` (attached read-only) or `{"load": [FILES], "tpch": SCALE}` (built in memory once and reused by later runs). `config` takes any `AgentConfig` field; unknown fields are an error. Several runs can go at once (A/B), each on its own connection. A bad request gets `{"type": "error", "error": "..."}`. Closing stdin stops every run and exits. The details are in the module docstring of `duckdb_agent/serve.py`.
+
 ## Traces
 
 Every run is recorded in `agent_traces.duckdb`. DuckDB lets only one process open a file for writing, so the traces are written through a background [Quack](https://duckdb.org/docs/2.0/quack/overview) server that owns the file. The first run starts it, on `quack:localhost:9494`, and it keeps running until `--stop-traces-server`, so you can read traces in another terminal while runs write them.
@@ -163,7 +206,7 @@ uv run pytest --cov=duckdb_agent --cov-branch    # with coverage
 
 ```
 ├── agent_harness.py       command-line entry point
-├── duckdb_agent/          the agent package (traces_server.py: the Quack server)
+├── duckdb_agent/          the agent package (traces_server.py: the Quack server; serve.py: the app protocol)
 ├── tests/                 pytest suite
 ├── .env.example           environment template
 └── pyproject.toml / uv.lock
