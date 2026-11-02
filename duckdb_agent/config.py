@@ -45,6 +45,11 @@ THINKING = {"type": "adaptive", "display": "summarized"}
 DEFAULT_MAX_TOKENS = 16_000
 
 
+# The largest max_tokens a non-streaming call can ask for without the SDK refusing it.
+# Not enforced here (a streaming caller could go higher); front ends use it as the limit.
+MAX_NON_STREAMING_TOKENS = 21_000
+
+
 # Prompt caching, 5-minute TTL: loop turns are seconds apart, so every call refreshes
 # the entry and the pricier 1-hour TTL would buy nothing. Two breakpoints:
 #   1. on the system prompt -- caches tools + system (they render first), which are
@@ -68,20 +73,51 @@ CACHE_CONTROL = {"type": "ephemeral"}
 # clear_at_least skips a clear that wouldn't free enough to pay for that cache write.
 # The SQL (tool inputs) stays visible, so Claude knows what it ran and can re-run it.
 # Schema lookups are never cleared: they're small and stay relevant all run.
+#
+# These are the defaults; each is an AgentConfig field (context_*), so a run can tune
+# them. In DH-1 they're the context compressor's knobs: threshold, keep, clear at least,
+# and the sidechain (tools that are never cleared).
 CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
 
 
-CONTEXT_MANAGEMENT = {
-    "edits": [
-        {
-            "type": "clear_tool_uses_20250919",
-            "trigger": {"type": "input_tokens", "value": 80_000},
-            "keep": {"type": "tool_uses", "value": 8},
-            "clear_at_least": {"type": "input_tokens", "value": 20_000},
-            "exclude_tools": ["list_tables", "describe_table"],
-        }
-    ]
-}
+CONTEXT_TRIGGER_TOKENS = 80_000
+
+
+CONTEXT_KEEP_TOOL_USES = 8
+
+
+CONTEXT_CLEAR_AT_LEAST_TOKENS = 20_000
+
+
+CONTEXT_PROTECTED_TOOLS = ("list_tables", "describe_table")
+
+
+# Every tool the agent can call, for checking context_protected_tools (tools.py defines
+# them; listed here so config doesn't import tools).
+TOOL_NAMES = ("list_tables", "describe_table", "sample_rows", "query_database", "submit_answer")
+
+
+def build_context_management(
+    trigger_tokens: int, keep_tool_uses: int, clear_at_least_tokens: int, protected_tools
+) -> dict:
+    """The context_management request parameter for these settings."""
+    return {
+        "edits": [
+            {
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": trigger_tokens},
+                "keep": {"type": "tool_uses", "value": keep_tool_uses},
+                "clear_at_least": {"type": "input_tokens", "value": clear_at_least_tokens},
+                "exclude_tools": list(protected_tools),
+            }
+        ]
+    }
+
+
+# With the defaults (what AgentConfig().context_management() returns).
+CONTEXT_MANAGEMENT = build_context_management(
+    CONTEXT_TRIGGER_TOKENS, CONTEXT_KEEP_TOOL_USES, CONTEXT_CLEAR_AT_LEAST_TOKENS, CONTEXT_PROTECTED_TOOLS
+)
 
 
 # SDK-level retries (exponential backoff, honors retry-after) for 408/409/429/5xx
@@ -122,6 +158,14 @@ class AgentConfig:
     # Off switches for API features some gateways reject.
     prompt_caching: bool = True
     context_editing: bool = True
+    # Context editing (see CONTEXT_MANAGEMENT): clear old tool results once a prompt
+    # passes context_trigger_tokens, keeping the last context_keep_tool_uses, and only
+    # if at least context_clear_at_least_tokens would be freed. Results of
+    # context_protected_tools are never cleared. Ignored when context_editing is off.
+    context_trigger_tokens: int = CONTEXT_TRIGGER_TOKENS
+    context_keep_tool_uses: int = CONTEXT_KEEP_TOOL_USES
+    context_clear_at_least_tokens: int = CONTEXT_CLEAR_AT_LEAST_TOKENS
+    context_protected_tools: tuple[str, ...] = CONTEXT_PROTECTED_TOOLS
     # None builds the default prompt from these settings (build_system_prompt).
     system_prompt: str | None = None
 
@@ -134,6 +178,28 @@ class AgentConfig:
                 raise ValueError(f"{name} must be a positive integer, not {value!r}")
         if not self.query_timeout_seconds or self.query_timeout_seconds <= 0:
             raise ValueError(f"query_timeout_seconds must be positive, not {self.query_timeout_seconds!r}")
+        if not isinstance(self.context_trigger_tokens, int) or self.context_trigger_tokens < 1:
+            raise ValueError(f"context_trigger_tokens must be a positive integer, not {self.context_trigger_tokens!r}")
+        for name in ("context_keep_tool_uses", "context_clear_at_least_tokens"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a whole number, 0 or more, not {value!r}")
+        # Lists (from JSON) become tuples, so the config stays hashable and frozen.
+        protected = self.context_protected_tools
+        if isinstance(protected, str) or not all(isinstance(t, str) for t in protected):
+            raise ValueError("context_protected_tools must be a list of tool names")
+        unknown = sorted(set(protected) - set(TOOL_NAMES))
+        if unknown:
+            raise ValueError(f"context_protected_tools has unknown tools: {', '.join(unknown)} "
+                             f"(tools: {', '.join(TOOL_NAMES)})")
+        object.__setattr__(self, "context_protected_tools", tuple(dict.fromkeys(protected)))
+
+    def context_management(self) -> dict:
+        """The context_management request parameter for this config."""
+        return build_context_management(
+            self.context_trigger_tokens, self.context_keep_tool_uses,
+            self.context_clear_at_least_tokens, self.context_protected_tools
+        )
 
     def to_dict(self) -> dict:
         """Settings for agent_runs.config. The system prompt actually sent (custom or
@@ -143,6 +209,7 @@ class AgentConfig:
         from .prompts import build_system_prompt
 
         settings = asdict(self)
+        settings["context_protected_tools"] = list(self.context_protected_tools)  # as JSON has it
         prompt = build_system_prompt(self)
         settings["system_prompt"] = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()[:12]
         return settings
