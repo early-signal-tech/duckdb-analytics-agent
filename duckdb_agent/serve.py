@@ -336,7 +336,7 @@ class Server:
             result = run_agent(
                 conn, prompt, tables=tables, config=config, traces_conn=traces_conn, client=client,
                 on_event=lambda event: self.send({"id": request_id, "type": "event", **event}),
-                cancel=cancel, **(recorded or {})
+                cancel=cancel, source_db=None if source["db"] == IN_MEMORY else source["db"], **(recorded or {})
             )
             self.send({"id": request_id, "type": "result", "result": dataclasses.asdict(result)})
         except Exception as e:

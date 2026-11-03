@@ -103,6 +103,17 @@ def test_run_start_records_the_source(tmp_path, traces_conn):
     ).fetchone()[0] == db
 
 
+def test_a_source_duckdb_cant_name_is_recorded_as_attached(traces_conn):
+    """A DuckLake attached through a secret reports an empty path; the caller's URI is kept."""
+    conn = duckdb.connect()
+    conn.execute("CREATE TABLE t AS SELECT 1 AS a")
+    client = FakeClient(response("tool_use", tool_use("SELECT a FROM t")), response("end_turn", text("1")))
+    result = run_agent(conn, "q", client=client, traces_conn=traces_conn, source_db="ducklake:ducklake_prod")
+    assert traces_conn.execute(
+        "SELECT source_db FROM agent_runs WHERE run_id = ?", [result.run_id]
+    ).fetchone()[0] == "ducklake:ducklake_prod"
+
+
 def test_replay_script_runs_in_a_fresh_session(tmp_path, traces_conn):
     db = str(tmp_path / "data.duckdb")
     duckdb.connect(db).execute("CREATE SCHEMA sales; CREATE TABLE sales.t AS SELECT 42 AS a").close()

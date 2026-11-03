@@ -44,6 +44,8 @@ def run(conn, traces_conn, *calls, **settings):
 
 @pytest.mark.parametrize("sql, error_type", [
     ("DELETE FROM t", "read_only_violation"),
+    ("SELECT 1; SELECT 2", "multiple_statements"),
+    ("SELECT 1; DELETE FROM t", "read_only_violation"),
     ("SELEC 1", "sql_parse_error"),
     ("SELECT nope FROM t", "BinderException"),
     ("SELECT * FROM missing_table", "CatalogException"),
@@ -148,3 +150,9 @@ def test_error_breakdown_query(conn, traces_conn):
         "SELECT error_type, count(*) FROM tool_calls WHERE NOT success GROUP BY ALL ORDER BY 2 DESC"
     ).fetchall()
     assert breakdown == [("BinderException", 2), ("read_only_violation", 1)]
+
+
+def test_several_reads_get_a_message_that_says_what_to_do(conn):
+    result = execute_query(conn, "SELECT 1; SELECT 2; SELECT 3")
+    assert result["error_type"] == "multiple_statements"
+    assert result["error"] == "Send one query per call: this has 3 statements. Run them one at a time."

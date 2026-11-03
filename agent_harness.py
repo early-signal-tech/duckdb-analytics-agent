@@ -177,7 +177,8 @@ def main(argv=None, client=None) -> int:
         structured_answer=args.structured,
     )
     result = run_agent(
-        conn, args.prompt, tables=args.tables, config=config, traces_conn=traces_conn, client=client
+        conn, args.prompt, tables=args.tables, config=config, traces_conn=traces_conn, client=client,
+        source_db=None if args.db == IN_MEMORY else (args.save_db or args.db),
     )
     if args.quiet:
         print(result.text)  # verbose mode already logged it
