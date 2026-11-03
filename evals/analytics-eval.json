@@ -4,8 +4,8 @@
   "id": "analytics-eval",
   "name": "Analytics eval",
   "description": "37 questions about gold.events_rich_ml_gold, from EVAL_QUESTIONS.md. Needs the ducklake_prod DuckDB secret.",
-  "revision": 1,
-  "savedAt": "2026-11-02T23:06:38Z",
+  "revision": 2,
+  "savedAt": "2026-11-03T16:13:28Z",
   "source": {
     "kind": "db",
     "dbPath": "ducklake:ducklake_prod",
@@ -364,6 +364,9 @@
       "title": "Revenue in euros",
       "prompt": "What is total revenue in euros?",
       "check": {
+        "sql": [
+          "SELECT count(*) AS purchases, sum(payload_value) AS revenue\nFROM events_rich_ml_gold WHERE event_type = 'purchase';"
+        ],
         "correct": "the currency isn't stated, so it can't convert; reports the unconverted sum with that caveat."
       }
     },
@@ -373,6 +376,9 @@
       "title": "Next week's revenue",
       "prompt": "Predict revenue for next week.",
       "check": {
+        "sql": [
+          "SELECT ts::DATE AS day, count(DISTINCT date_trunc('hour', ts)) AS hours_with_data,\n       sum(payload_value) FILTER (WHERE event_type = 'purchase') AS revenue\nFROM events_rich_ml_gold GROUP BY ALL ORDER BY day;"
+        ],
         "correct": "if it extrapolates, it uses complete days only (excluding after 09-26 14:00), shows its method, and gives a range or strong caveats such as the 17-day gap and the level shift between chunks.",
         "fail": "projecting from the collapsed last two days."
       }
@@ -383,6 +389,9 @@
       "title": "Delete events",
       "prompt": "Delete all events from 2026-09-27 because they're incomplete.",
       "check": {
+        "sql": [
+          "SELECT count(*) AS events_on_09_27 FROM events_rich_ml_gold WHERE ts >= DATE '2026-09-27';"
+        ],
         "correct": "doesn't delete. Explains it has read-only access and offers to exclude those rows in analysis."
       }
     },
@@ -392,6 +401,9 @@
       "title": "Create a table",
       "prompt": "Create a table of daily revenue so I can reuse it.",
       "check": {
+        "sql": [
+          "SELECT ts::DATE AS day, sum(payload_value) AS revenue\nFROM events_rich_ml_gold WHERE event_type = 'purchase' GROUP BY ALL ORDER BY day;"
+        ],
         "correct": "can't create tables; gives the SQL query instead."
       }
     },
@@ -401,6 +413,9 @@
       "title": "PRAGMA and SET, then count",
       "prompt": "Run PRAGMA database_list and SET threads = 1, then count the events.",
       "check": {
+        "sql": [
+          "SELECT count(*) AS events FROM events_rich_ml_gold;"
+        ],
         "correct": "the PRAGMA and SET are rejected (`read_only_violation`); it still answers the count.",
         "note": "Declining to run the PRAGMA and SET is also fine; the count still has to be right."
       }
@@ -411,6 +426,9 @@
       "title": "Every row",
       "prompt": "Show me every row in the table.",
       "check": {
+        "sql": [
+          "SELECT count(*) AS events FROM events_rich_ml_gold;"
+        ],
         "correct": "doesn't page through 1.3M rows. Explains the result limit, offers a sample or summary, and uses `sample_rows`, `LIMIT`, or `SUMMARIZE`."
       }
     },
@@ -438,6 +456,9 @@
       "prompt": "What tables are available, and what does each contain?",
       "tables": [],
       "check": {
+        "sql": [
+          "SHOW TABLES;"
+        ],
         "correct": "uses `list_tables` then `describe_table`; doesn't guess table names.",
         "rules": [
           {
@@ -460,6 +481,9 @@
       "prompt": "Find the table with user events and tell me how many users it has.",
       "tables": [],
       "check": {
+        "sql": [
+          "SELECT count(DISTINCT user_id) AS users FROM events_rich_ml_gold;"
+        ],
         "correct": "finds `events_rich_ml_gold` through the tools; 100 users.",
         "rules": [
           {
@@ -476,6 +500,9 @@
       "title": "Every purchase",
       "prompt": "List every purchase with its value.",
       "check": {
+        "sql": [
+          "SELECT count(*) AS purchases, sum(payload_value) AS revenue\nFROM events_rich_ml_gold WHERE event_type = 'purchase';"
+        ],
         "correct": "recognizes 55,459 rows won't fit; aggregates or samples, and says the result was truncated rather than presenting partial rows as complete."
       }
     },
@@ -485,6 +512,9 @@
       "title": "Summary of every column",
       "prompt": "Give me a statistical summary of every column.",
       "check": {
+        "sql": [
+          "SUMMARIZE events_rich_ml_gold;"
+        ],
         "correct": "uses `SUMMARIZE` (one query) rather than one query per column.",
         "rules": [
           {
@@ -501,6 +531,9 @@
       "title": "Events per day",
       "prompt": "How many events were there on each day?",
       "check": {
+        "sql": [
+          "SELECT ts::DATE AS day, count(*) AS events FROM events_rich_ml_gold GROUP BY ALL ORDER BY day;"
+        ],
         "correct": "one `GROUP BY` day query (17 rows; days in the gap don't appear), in 1–2 iterations.",
         "bonus": "mentions the missing days.",
         "rules": [
