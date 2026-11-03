@@ -20,7 +20,7 @@ INSTALL tpch; LOAD tpch;
 SELECT * FROM tpch_answers() WHERE query_nr = 1 AND scale_factor = 0.1;
 ```
 
-Pass means the agent's numbers match the reference result, not that its SQL matches the reference text: any correct query is fine. Several questions are hard to ask in plain language (Q19, Q22), so also judge whether the agent states its assumptions.
+Pass means the agent's numbers match the reference result, not that its SQL matches the reference text: any correct query is fine. Some questions are hard to ask exactly in plain language (Q19), so also judge whether the agent states its assumptions. Q8, Q12, Q18, and Q22 were reworded on 2026-11-03 to say everything their reference SQL assumes: graded runs showed every preset answering the old wording differently from the reference.
 
 Run each question below with `--prompt`, one run each, and compare `agent_runs` in the traces (status, iterations, cost).
 
@@ -281,7 +281,7 @@ ORDER BY
 
 ## Q8. National market share
 
-**Question:** What is BRAZIL's share of 1995 and 1996 revenue for ECONOMY ANODIZED STEEL parts sold to customers in the AMERICA region, by year?
+**Question:** For ECONOMY ANODIZED STEEL parts sold to customers in the AMERICA region in 1995 and 1996, what share of that revenue came from suppliers in BRAZIL, by year?
 
 ```sql
 SELECT
@@ -436,7 +436,7 @@ ORDER BY
 
 ## Q12. Shipping modes and order priority
 
-**Question:** For MAIL and SHIP shipments received in 1994 after their commit date, how many orders were high priority versus not, by ship mode?
+**Question:** For MAIL and SHIP line items received in 1994 that were shipped before their commit date but received after it, how many were on high-priority orders (1-URGENT or 2-HIGH) versus other orders, by ship mode?
 
 ```sql
 SELECT
@@ -615,7 +615,7 @@ WHERE
 
 ## Q18. Large volume customer
 
-**Question:** Which 100 customers placed orders with a total quantity over 300? Show the largest orders first.
+**Question:** Which orders have line items totaling more than 300 units? For up to 100 of them, show the customer, order key, order date, total price, and total quantity, largest total price first.
 
 ```sql
 SELECT
@@ -777,7 +777,7 @@ LIMIT 100;
 
 ## Q22. Global sales opportunity
 
-**Question:** Among customers in specific country codes with above-average balances and no orders, how many are there and what is their total balance, by country code?
+**Question:** Among customers whose phone number starts with country code 13, 31, 23, 29, 30, 18, or 17 and who have never placed an order, how many have an account balance above the average positive balance of customers in those codes, and what is their total balance, by country code?
 
 ```sql
 SELECT
