@@ -292,3 +292,24 @@ def test_traces_reset_waits_for_runs(db, tmp_path):
     assert (tmp_path / "traces.duckdb").exists()
     srv.handle({"id": "s", "type": "stop", "run": "r1"})
     srv.wait_all()
+
+
+def test_the_requested_data_is_recorded_with_the_run(db, tmp_path):
+    traces_path = str(tmp_path / "traces.duckdb")
+    srv, _ = server(FakeClient(response("end_turn", text("3")), response("end_turn", text("3"))),
+                    traces=lambda: init_traces_db(traces_path))
+    srv.handle({"id": "r1", "type": "run", "prompt": "q", "source": {"db": db, "schema": "main"}})
+    srv.wait_all()
+    srv.handle({"id": "r2", "type": "run", "prompt": "q", "source": {"tpch": 0.01}})
+    srv.wait_all()
+    rows = duckdb.connect(traces_path).execute(
+        "SELECT data_source::JSON::VARCHAR FROM agent_runs ORDER BY started_at").fetchall()
+    assert [json.loads(r[0]) for r in rows] == [{"db": db, "schema": "main"}, {"tpch": 0.01}]
+
+
+def test_request_data_source():
+    from duckdb_agent import request_data_source
+    assert request_data_source(":memory:", None, ["a.csv"], None) == {"load": ["a.csv"]}
+    assert request_data_source(":memory:", None, [], 0.1) == {"tpch": 0.1}
+    assert request_data_source("ducklake:prod", "gold") == {"db": "ducklake:prod", "schema": "gold"}
+    assert request_data_source(":memory:") is None

@@ -55,7 +55,7 @@ from .loop import run_agent
 from .serialization import json_dumps
 from .sources import IN_MEMORY, connect, use_statement
 from .traces_server import DEFAULT_PORT, connect_traces_db, server_status, stop_traces_server
-from .tracing import reset_traces_db
+from .tracing import request_data_source, reset_traces_db
 from .usage import MODEL_PRICING
 
 
@@ -336,7 +336,9 @@ class Server:
             result = run_agent(
                 conn, prompt, tables=tables, config=config, traces_conn=traces_conn, client=client,
                 on_event=lambda event: self.send({"id": request_id, "type": "event", **event}),
-                cancel=cancel, source_db=None if source["db"] == IN_MEMORY else source["db"], **(recorded or {})
+                cancel=cancel, source_db=None if source["db"] == IN_MEMORY else source["db"],
+                data_source=request_data_source(source["db"], source["schema"], source["load"], source["tpch"]),
+                **(recorded or {})
             )
             self.send({"id": request_id, "type": "result", "result": dataclasses.asdict(result)})
         except Exception as e:

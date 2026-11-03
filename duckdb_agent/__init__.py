@@ -25,7 +25,7 @@ from .config import DEFAULT_CONFIG, AgentConfig
 from .log import configure_logging
 from .loop import AgentResult, run_agent
 from .traces_server import connect_traces_db, stop_traces_server
-from .tracing import TracesDB, init_traces_db, reset_traces_db
+from .tracing import TracesDB, init_traces_db, request_data_source, reset_traces_db
 
 __all__ = [
     "AgentConfig",
@@ -35,6 +35,7 @@ __all__ = [
     "configure_logging",
     "connect_traces_db",
     "init_traces_db",
+    "request_data_source",
     "reset_traces_db",
     "run_agent",
     "stop_traces_server",

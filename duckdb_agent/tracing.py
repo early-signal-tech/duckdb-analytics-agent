@@ -48,6 +48,11 @@ TRACES_TABLES = {
         "source_db": "VARCHAR",
         "source_catalog": "VARCHAR",
         "source_schema": "VARCHAR",
+        # The data the run was asked to use, as the request gave it: {db, schema} for a
+        # database file or ducklake: URI, {load: [files]}, or {tpch: scale}. Enough to open
+        # the same data again (e.g. to run a reference query on it). NULL for runs from
+        # before it was recorded.
+        "data_source": "VARIANT",
         # The tables the answer rests on (schema.table): from submit_answer's
         # supporting_sql in structured runs ('supporting_sql'), else from the last
         # successful query ('last_query'). NULL when the run didn't produce an answer.
@@ -342,6 +347,18 @@ def reset_traces_db(traces_db_path: str = "agent_traces.duckdb") -> bool:
     return deleted
 
 
+def request_data_source(db: str | None, schema: str | None = None, load=(), tpch: float | None = None) -> dict | None:
+    """The data a run was asked to use, for agent_runs.data_source: {tpch}, {load}, or
+    {db, schema} (an in-memory db with nothing loaded is None)."""
+    if tpch is not None:
+        return {"tpch": tpch}
+    if load:
+        return {"load": list(load)}
+    if db and db != ":memory:":
+        return {"db": db, **({"schema": schema} if schema else {})}
+    return None
+
+
 def init_traces_db(traces_db_path: str = "agent_traces.duckdb") -> TracesDB:
     """Open the traces file directly (this process holds it) and create the schema.
     To share it with readers in other processes, use connect_traces_db instead."""
@@ -454,6 +471,7 @@ def log_run_summary(
     preset: dict = None,
     labels: dict = None,
     source: dict = None,
+    data_source: dict = None,
     answer_tables: list[str] = None,
     answer_tables_from: str = None,
     started_at: datetime = None,
@@ -463,7 +481,7 @@ def log_run_summary(
     estimated_cost_usd: float = None
 ):
     """Log the summary of an agent run. `config` is AgentConfig.to_dict(); `source` is
-    describe_source(); `usage` is AgentResult.usage (token totals by USAGE_FIELDS name)."""
+    describe_source(); `data_source` is the requested data (see request_data_source); `usage` is AgentResult.usage (token totals by USAGE_FIELDS name)."""
     ended_at = datetime.now()
     usage = usage or {}
     source = source or {}
@@ -484,6 +502,7 @@ def log_run_summary(
         "source_db": source.get("source_db"),
         "source_catalog": source.get("source_catalog"),
         "source_schema": source.get("source_schema"),
+        "data_source": data_source,
         "answer_tables": answer_tables,
         "answer_tables_from": answer_tables_from,
         "started_at": started_at,

@@ -22,7 +22,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from duckdb_agent import AgentConfig, configure_logging, connect_traces_db, reset_traces_db, run_agent, stop_traces_server
+from duckdb_agent import (
+    AgentConfig, configure_logging, connect_traces_db, request_data_source, reset_traces_db, run_agent, stop_traces_server,
+)
 from duckdb_agent.traces_server import DEFAULT_PORT, TracesServerError, start_traces_server, state_paths
 from duckdb_agent.config import DEFAULT_EFFORT, DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, EFFORT_LEVELS
 # Re-exported: the CLI's data setup lives in the package so the app server can share it.
@@ -179,6 +181,8 @@ def main(argv=None, client=None) -> int:
     result = run_agent(
         conn, args.prompt, tables=args.tables, config=config, traces_conn=traces_conn, client=client,
         source_db=None if args.db == IN_MEMORY else (args.save_db or args.db),
+        data_source=request_data_source(args.save_db, args.schema) if args.save_db
+        else request_data_source(args.db, args.schema, args.load or (), args.tpch),
     )
     if args.quiet:
         print(result.text)  # verbose mode already logged it
