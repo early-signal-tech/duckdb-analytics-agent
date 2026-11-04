@@ -16,10 +16,13 @@ normally and 1 otherwise (max iterations, API error, refusal, ...).
 """
 import argparse
 import os
+import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
+import duckdb
 from dotenv import load_dotenv
 
 from duckdb_agent import (
@@ -134,6 +137,32 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+def _major_minor(version: str) -> tuple[int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)", version)
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def cli_version_problem(duckdb_cli: str) -> str | None:
+    """Why this duckdb CLI can't read the traces server, or None if it can (or can't tell).
+
+    The server runs on this package's DuckDB, and Quack only talks to a client of the
+    same major.minor version: an older CLI fails with "Serialization Error: Failed to
+    deserialize". An unreadable version is let through rather than blocking the shell.
+    """
+    try:
+        out = subprocess.run([duckdb_cli, "--version"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    cli, server = _major_minor(out), _major_minor(duckdb.__version__)
+    if cli is None or server is None or cli == server:
+        return None
+    shown = out.split()[0].lstrip("v") if out.split() else out.strip()
+    return (
+        f"Your duckdb CLI ({duckdb_cli}) is {shown}; the traces need {server[0]}.{server[1]}.\n"
+        f"Install a matching CLI with: curl https://install.duckdb.org | DUCKDB_VERSION={duckdb.__version__} sh"
+    )
+
+
 def open_traces_shell(traces_db: str, port: int) -> int:
     """Replace this process with the duckdb CLI, connected to the traces server."""
     try:
@@ -145,6 +174,9 @@ def open_traces_shell(traces_db: str, port: int) -> int:
     duckdb_cli = shutil.which("duckdb")
     if not duckdb_cli:
         print(f"duckdb CLI not found on PATH. Install it, then run: duckdb -init {init_script}", file=sys.stderr)
+        return 1
+    if problem := cli_version_problem(duckdb_cli):
+        print(problem, file=sys.stderr)
         return 1
     os.execv(duckdb_cli, [duckdb_cli, "-init", init_script])
 

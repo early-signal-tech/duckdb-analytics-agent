@@ -165,3 +165,24 @@ def test_failed_build_leaves_no_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         agent_harness.build_database(str(path), [str(tmp_path / "missing.csv")])
     assert not path.exists()
+
+
+def _fake_cli(tmp_path, output):
+    cli = tmp_path / "duckdb"
+    cli.write_text(f"#!/bin/sh\necho '{output}'\n")
+    cli.chmod(0o755)
+    return str(cli)
+
+
+def test_traces_shell_rejects_an_older_cli(tmp_path):
+    problem = agent_harness.cli_version_problem(_fake_cli(tmp_path, "v1.5.6 (Variegata) 069cc9f9b5"))
+    assert "is 1.5.6; the traces need 2.0" in problem and f"DUCKDB_VERSION={duckdb.__version__}" in problem
+
+
+def test_traces_shell_accepts_a_matching_cli(tmp_path):
+    version = duckdb.__version__
+    assert agent_harness.cli_version_problem(_fake_cli(tmp_path, f"v{version} (Codename) abc123")) is None
+
+
+def test_traces_shell_lets_an_unreadable_version_through(tmp_path):
+    assert agent_harness.cli_version_problem(_fake_cli(tmp_path, "something odd")) is None
