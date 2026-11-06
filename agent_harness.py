@@ -28,7 +28,9 @@ from dotenv import load_dotenv
 from duckdb_agent import (
     AgentConfig, configure_logging, connect_traces_db, request_data_source, reset_traces_db, run_agent, stop_traces_server,
 )
-from duckdb_agent.traces_server import DEFAULT_PORT, TracesServerError, start_traces_server, state_paths
+from duckdb_agent.traces_server import (
+    DEFAULT_PORT, TracesServerError, TracesServerOutdated, start_traces_server, state_paths,
+)
 from duckdb_agent.config import DEFAULT_EFFORT, DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, EFFORT_LEVELS
 # Re-exported: the CLI's data setup lives in the package so the app server can share it.
 from duckdb_agent.sources import (  # noqa: F401
@@ -203,7 +205,11 @@ def main(argv=None, client=None) -> int:
         conn = connect(args.db, args.schema, args.load, args.tpch)
     if args.reset_traces and reset_traces_db(args.traces_db):
         print(f"Reset traces: deleted {args.traces_db}", file=sys.stderr)
-    traces_conn = connect_traces_db(args.traces_db, server=not args.no_traces_server, port=args.traces_port)
+    try:
+        traces_conn = connect_traces_db(args.traces_db, server=not args.no_traces_server, port=args.traces_port)
+    except TracesServerOutdated as e:
+        print(f"Traces unavailable: {e}", file=sys.stderr)
+        return 1
     config = AgentConfig(
         model=args.model,
         effort=args.effort,

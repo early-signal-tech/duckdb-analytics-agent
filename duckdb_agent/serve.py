@@ -8,9 +8,13 @@ caller picks) and a "type"; every message names the request it belongs to by "id
 
 Requests:
     {"id": "h", "type": "hello"}
-        -> {"id": "h", "type": "hello", "protocol": 1, "defaults": {...AgentConfig fields},
+        -> {"id": "h", "type": "hello", "protocol": 1, "version": "0.1.0",
+            "traces_schema": "<SCHEMA_VERSION>", "defaults": {...AgentConfig fields},
             "effort_levels": [...], "priced_models": [...], "limits": {"max_tokens": ...},
             "tools": [...]}
+        "version" is the duck-harness package's; "traces_schema" names the traces tables
+        and views this code writes (tracing.SCHEMA_VERSION). Engines that share a traces
+        file must agree on it.
     {"id": "r1", "type": "run", "prompt": "...",
      "source": {"db": "tpch.duckdb", "schema": null} | {"load": ["a.csv"], "tpch": 0.1},
      "tables": ["orders"], "config": {"effort": "high", "max_iterations": 10, ...},
@@ -23,7 +27,10 @@ Requests:
     {"id": "s", "type": "stop", "run": "r1"}       -> {"id": "s", "type": "ok"}
     {"id": "t", "type": "traces"}
         -> {"id": "t", "type": "traces", "enabled": true, "db": "/abs/agent_traces.duckdb",
-            "exists": true, "size_bytes": 123, "server": {"running": true, "uri": "quack:…", "pid": 1}}
+            "exists": true, "size_bytes": 123,
+            "server": {"running": true, "uri": "quack:…", "pid": 1, "current": true}}
+        "current" is false when the running server was started by a different version
+        (another traces schema); runs are refused until it's stopped.
     {"id": "t", "type": "traces_stop"}             -> {"id": "t", "type": "ok", "stopped": true}
     {"id": "t", "type": "traces_reset"}            -> {"id": "t", "type": "ok", "deleted": true}
     {"id": "q", "type": "shutdown"}                -> {"id": "q", "type": "ok"}, then exit
@@ -49,13 +56,14 @@ import anthropic
 import duckdb
 from dotenv import load_dotenv
 
+from . import package_version
 from .config import API_MAX_RETRIES, DEFAULT_CONFIG, EFFORT_LEVELS, MAX_NON_STREAMING_TOKENS, TOOL_NAMES, AgentConfig
 from .log import configure_logging, logger
 from .loop import run_agent
 from .serialization import json_dumps
 from .sources import IN_MEMORY, connect, use_statement
 from .traces_server import DEFAULT_PORT, connect_traces_db, server_status, stop_traces_server
-from .tracing import request_data_source, reset_traces_db
+from .tracing import SCHEMA_VERSION, request_data_source, reset_traces_db
 from .usage import MODEL_PRICING
 
 
@@ -226,6 +234,8 @@ class Server:
                 "id": request_id,
                 "type": "hello",
                 "protocol": PROTOCOL_VERSION,
+                "version": package_version(),
+                "traces_schema": SCHEMA_VERSION,
                 "defaults": dataclasses.asdict(DEFAULT_CONFIG),
                 "effort_levels": list(EFFORT_LEVELS),
                 "priced_models": sorted(MODEL_PRICING),
@@ -270,6 +280,7 @@ class Server:
                 "running": state is not None,
                 "uri": state.get("uri") if state else None,
                 "pid": state.get("pid") if state else None,
+                "current": state.get("schema_version") == SCHEMA_VERSION if state else None,
             },
         }
 

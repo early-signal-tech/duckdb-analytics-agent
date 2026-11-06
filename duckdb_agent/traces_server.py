@@ -53,6 +53,22 @@ class TracesServerError(Exception):
     """The traces server could not be started or reached."""
 
 
+class TracesServerOutdated(TracesServerError):
+    """A traces server is running for this file, but it was started by code with a
+    different traces schema. It isn't stopped automatically: another program (the app,
+    the CLI, a duckdb shell) may be using it. Stop it, and the next run starts one that
+    matches."""
+
+    def __init__(self, db_path: str, state: dict):
+        self.pid, self.schema_version = state.get("pid"), state.get("schema_version")
+        super().__init__(
+            f"the traces server for {db_path} (pid {self.pid}) was started by a different version "
+            f"(traces schema {self.schema_version or 'unknown'}; this code uses {SCHEMA_VERSION}). "
+            "Stop it and the next run starts a new one: Settings → Traces server → Stop, or "
+            "`uv run agent_harness.py --stop-traces-server`."
+        )
+
+
 def state_paths(db_path: str) -> dict:
     db_path = os.path.abspath(db_path)
     return {name: Path(f"{db_path}.quack.{name}") for name in ("json", "sql", "log")}
@@ -106,15 +122,14 @@ def _pid_is_server(pid: int) -> bool:
 
 def start_traces_server(db_path: str, port: int = DEFAULT_PORT) -> dict:
     """Return the running server for `db_path`, starting one in the background if none
-    is answering. A server started by older code (a different SCHEMA_VERSION) is
-    restarted, so its tables and views match this code. Raises TracesServerError if
-    it can't be started."""
+    is answering. Raises TracesServerOutdated if the running one was started by code
+    with a different SCHEMA_VERSION (it's never stopped from here: it may not be ours),
+    and TracesServerError if one can't be started."""
     state = server_status(db_path)
     if state and state.get("schema_version") == SCHEMA_VERSION:
         return state
     if state:
-        logger.info("Restarting the traces server (pid %s): it has an older traces schema.", state["pid"])
-        stop_traces_server(db_path)
+        raise TracesServerOutdated(db_path, state)
     paths = state_paths(db_path)
     package_root = str(Path(__file__).resolve().parent.parent)
     env = {
@@ -167,7 +182,9 @@ def stop_traces_server(db_path: str, timeout_seconds: float = 10) -> bool:
 def connect_traces_db(db_path: str = "agent_traces.duckdb", server: bool = True, port: int = DEFAULT_PORT) -> TracesDB:
     """Connect to the traces database, through its Quack server when `server` is set
     (starting it if needed), so other processes can read it while runs write. If the
-    server can't be started, falls back to opening the file directly, with a warning."""
+    server can't be started, falls back to opening the file directly, with a warning.
+    A server from a different version raises TracesServerOutdated instead: it holds the
+    file, so there's nothing to fall back to."""
     if not server:
         return init_traces_db(db_path)
     try:
@@ -175,6 +192,8 @@ def connect_traces_db(db_path: str = "agent_traces.duckdb", server: bool = True,
         conn = duckdb.connect()
         conn.execute("ATTACH ? AS traces (TYPE quack, TOKEN ?)", [state["uri"], state["token"]])
         conn.execute("USE traces")
+    except TracesServerOutdated:
+        raise
     except (TracesServerError, duckdb.Error) as e:
         logger.warning("Traces server unavailable (%s); writing %s directly, so other processes "
                        "can't read it during the run.", e, db_path)

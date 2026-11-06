@@ -21,20 +21,34 @@ Modules:
     serialization DuckDB values to JSON
 """
 
+from importlib.metadata import PackageNotFoundError, version as _version
+
 from .config import DEFAULT_CONFIG, AgentConfig
 from .log import configure_logging
 from .loop import AgentResult, run_agent
-from .traces_server import connect_traces_db, stop_traces_server
-from .tracing import TracesDB, init_traces_db, request_data_source, reset_traces_db
+from .traces_server import TracesServerOutdated, connect_traces_db, stop_traces_server
+from .tracing import SCHEMA_VERSION, TracesDB, init_traces_db, request_data_source, reset_traces_db
+
+
+def package_version() -> str:
+    """The installed duck-harness version, as engines report it in hello."""
+    try:
+        return _version("duck-harness")
+    except PackageNotFoundError:
+        return "unknown"
+
 
 __all__ = [
     "AgentConfig",
     "AgentResult",
     "DEFAULT_CONFIG",
+    "SCHEMA_VERSION",
     "TracesDB",
+    "TracesServerOutdated",
     "configure_logging",
     "connect_traces_db",
     "init_traces_db",
+    "package_version",
     "request_data_source",
     "reset_traces_db",
     "run_agent",
