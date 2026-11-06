@@ -13,6 +13,7 @@ Modules:
     sql           read-only check, query execution, timeouts, cancellation, result-size limits
     sources       opening the data: DuckDB files, ducklake: URIs, loaded files, TPC-H
     serve         JSON Lines protocol on stdin/stdout, for the desktop app
+    takes         what a rack played (runs, A/B pairs, setlists), read from the traces
     prompts       system prompt and wrap-up instructions
     tracing       traces database schema, TracesDB, and writers
     traces_server background Quack server that shares the traces database with readers

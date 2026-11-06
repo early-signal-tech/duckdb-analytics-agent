@@ -33,6 +33,13 @@ Requests:
         (another traces schema); runs are refused until it's stopped.
     {"id": "t", "type": "traces_stop"}             -> {"id": "t", "type": "ok", "stopped": true}
     {"id": "t", "type": "traces_reset"}            -> {"id": "t", "type": "ok", "deleted": true}
+    {"id": "k", "type": "takes", "rack_preset": "rack-…" | null, "limit": 50}
+        -> {"id": "k", "type": "takes", "takes": [{key, kind, started_at, ended_at, runs,
+            completed, cost_usd, prompt, setlist_name, question_set}, ...]}  (newest first)
+    {"id": "k", "type": "take", "key": "<a take's key>"}
+        -> {"id": "k", "type": "take", "runs": [{run_id, prompt, answer, status, error,
+            iterations, duration_ms, cost_usd, labels}, ...]}
+        A take is one press of PLAY in the rack: a run, an A/B pair, or a setlist (takes.py).
     {"id": "q", "type": "shutdown"}                -> {"id": "q", "type": "ok"}, then exit
 traces_stop stops the background traces server (the next run starts it again);
 traces_reset deletes the traces database. Both are refused while runs are active.
@@ -63,6 +70,7 @@ from .loop import run_agent
 from .serialization import json_dumps
 from .sources import IN_MEMORY, connect, use_statement
 from .traces_server import DEFAULT_PORT, connect_traces_db, server_status, stop_traces_server
+from .takes import list_takes, take_runs
 from .tracing import SCHEMA_VERSION, request_data_source, reset_traces_db
 from .usage import MODEL_PRICING
 
@@ -244,6 +252,8 @@ class Server:
                 "limits": {"max_tokens": MAX_NON_STREAMING_TOKENS},
                 "tools": list(TOOL_NAMES),
             })
+        elif kind in ("takes", "take"):
+            self.handle_takes(request_id, request)
         elif kind == "run":
             self.start_run(request)
         elif kind == "stop":
@@ -283,6 +293,31 @@ class Server:
                 "current": state.get("schema_version") == SCHEMA_VERSION if state else None,
             },
         }
+
+    def handle_takes(self, request_id: str, request: dict) -> None:
+        """What a rack preset played (takes), or one take's runs, read from the traces."""
+        if self.traces_path is None:
+            self.send_error(request_id, "traces are off")
+            return
+        traces = None
+        try:
+            traces = self.traces()
+            if request["type"] == "takes":
+                preset = request.get("rack_preset")
+                if preset is not None and not isinstance(preset, str):
+                    raise ValueError('"rack_preset" must be a preset id or null')
+                limit = int(request.get("limit") or 50)
+                self.send({"id": request_id, "type": "takes", "takes": list_takes(traces, preset, limit)})
+            else:
+                key = request.get("key")
+                if not isinstance(key, str) or not key:
+                    raise ValueError('"key" must be a take\'s key')
+                self.send({"id": request_id, "type": "take", "runs": take_runs(traces, key)})
+        except Exception as e:
+            self.send_error(request_id, f"{type(e).__name__}: {e}")
+        finally:
+            if traces is not None:
+                traces.close()
 
     def handle_traces(self, request_id: str, kind: str) -> None:
         if kind == "traces":
