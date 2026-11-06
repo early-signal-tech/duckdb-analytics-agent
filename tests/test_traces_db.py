@@ -8,7 +8,7 @@ import pytest
 from duckdb_agent import connect_traces_db, stop_traces_server
 from duckdb_agent.loop import run_agent
 from duckdb_agent import traces_server
-from duckdb_agent.traces_server import TracesServerError, server_status, state_paths
+from duckdb_agent.traces_server import TracesServerError, TracesServerOutdated, server_status, state_paths
 from duckdb_agent.tracing import TracesSchemaError, describe_source, init_traces_db
 from test_stop_reasons import FakeClient, response, text, tool_use
 
@@ -228,17 +228,22 @@ def test_server_that_fails_to_start_reports_why(tmp_path):
         holder.close()
 
 
-def test_server_from_older_code_is_restarted(served):
+def test_server_from_another_version_is_refused_not_stopped(served):
     path, port = served
     connect_traces_db(path, port=port).close()
-    old_pid = server_status(path)["pid"]
-    # As if the running server had been started by older code.
+    pid = server_status(path)["pid"]
+    # As if the running server had been started by another version.
     state_file = state_paths(path)["json"]
     state = json.loads(state_file.read_text())
     state_file.write_text(json.dumps({**state, "schema_version": "older"}))
+    with pytest.raises(TracesServerOutdated, match="different version") as refused:
+        connect_traces_db(path, port=port)
+    assert "older" in str(refused.value) and "--stop-traces-server" in str(refused.value)
+    assert server_status(path)["pid"] == pid  # still the same server: nothing was stopped
+    # Once it's stopped, the next connection starts a current one.
+    stop_traces_server(path)
     traces = connect_traces_db(path, port=port)
     assert traces.remote
-    assert server_status(path)["pid"] != old_pid
     traces.close()
 
 

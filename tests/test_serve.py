@@ -7,6 +7,7 @@ import time
 import duckdb
 import pytest
 
+from duckdb_agent import SCHEMA_VERSION, package_version
 from duckdb_agent.serve import Server
 from duckdb_agent.tracing import init_traces_db
 from test_stop_reasons import FakeClient, response, text, tool_use
@@ -63,6 +64,14 @@ def test_hello_reports_protocol_and_defaults():
     assert hello["protocol"] == 1
     assert hello["defaults"]["effort"] == "medium"
     assert "max" in hello["effort_levels"]
+
+
+def test_hello_reports_versions():
+    srv, out = server()
+    srv.handle({"id": "h", "type": "hello"})
+    (hello,) = out.messages
+    assert hello["version"] == package_version() != "unknown"
+    assert hello["traces_schema"] == SCHEMA_VERSION
 
 
 def test_run_streams_events_then_result(db, tmp_path):
