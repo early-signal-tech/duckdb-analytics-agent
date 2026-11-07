@@ -65,3 +65,23 @@ def test_serve_takes_and_take(tmp_path, traces):
     assert takes["type"] == "takes" and [t["key"] for t in takes["takes"]] == ["sl-1", "ab-1"]
     assert take["type"] == "take" and [r["labels"]["ab"] for r in take["runs"]] == ["A", "B"]
     assert bad["type"] == "error" and "key" in bad["error"]
+
+
+def test_takes_through_the_traces_server(tmp_path):
+    """The app reads takes through the Quack server, which doesn't forward query parameters."""
+    from duckdb_agent.traces_server import connect_traces_db, stop_traces_server
+    from test_traces_db import free_port
+    path = str(tmp_path / "served.duckdb")
+    traces = connect_traces_db(path, port=free_port())
+    try:
+        assert traces.remote
+        traces.insert("agent_runs", {"run_id": "r1", "prompt": "q", "status": "completed",
+                                     "labels": {"rack_preset": "it's-mine"}})
+        traces.insert("agent_runs", {"run_id": "a", "prompt": "q", "status": "completed",
+                                     "labels": {"rack_preset": "it's-mine", "pair": "ab-1", "ab": "A"}})
+        assert sorted(t["key"] for t in list_takes(traces, "it's-mine")) == ["ab-1", "r1"]  # a quote in an id is fine
+        assert [r["run_id"] for r in take_runs(traces, "ab-1")] == ["a"]
+        assert list_takes(traces, None) == []
+    finally:
+        traces.close()
+        stop_traces_server(path)

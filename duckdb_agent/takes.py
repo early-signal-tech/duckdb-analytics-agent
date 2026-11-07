@@ -12,11 +12,20 @@ takes is stored: they're worked out from the runs' labels.
 
 Runs are written to the traces when they finish, so a take that's still playing shows
 the runs done so far.
+
+Values go into the SQL as quoted literals, not as parameters: through the traces server
+(Quack), prepared-statement parameters aren't forwarded.
 """
 
 import json
 
 from .tracing import TracesDB
+
+
+def _lit(value: str) -> str:
+    """A string as a SQL literal."""
+    return "'" + value.replace("'", "''") + "'"
+
 
 TAKE_KEY = "coalesce(labels.setlist_run::VARCHAR, labels.pair::VARCHAR, run_id)"
 TAKE_KIND = (
@@ -28,8 +37,7 @@ TAKE_KIND = (
 def list_takes(traces: TracesDB, rack_preset: str | None, limit: int = 50) -> list[dict]:
     """A rack preset's takes, newest first. With no preset: the takes played outside any
     rack preset (the standalone apps, the CLI, the rack before presets)."""
-    where = "labels.rack_preset::VARCHAR = ?" if rack_preset else "labels.rack_preset IS NULL"
-    params = [rack_preset] if rack_preset else []
+    where = f"labels.rack_preset::VARCHAR = {_lit(rack_preset)}" if rack_preset else "labels.rack_preset IS NULL"
     rows = traces.execute(f"""
         SELECT {TAKE_KEY} AS key,
                any_value({TAKE_KIND}) AS kind,
@@ -46,7 +54,7 @@ def list_takes(traces: TracesDB, rack_preset: str | None, limit: int = 50) -> li
         GROUP BY 1
         ORDER BY min(started_at) DESC
         LIMIT {int(limit)}
-    """, params).fetchall()
+    """).fetchall()
     keys = ["key", "kind", "started_at", "ended_at", "runs", "completed", "cost_usd", "prompt", "setlist_name", "question_set"]
     out = []
     for row in rows:
@@ -66,10 +74,10 @@ def take_runs(traces: TracesDB, key: str) -> list[dict]:
         SELECT run_id, prompt, final_response, status, error, total_iterations, duration_ms,
                estimated_cost_usd, labels::JSON::VARCHAR
         FROM agent_runs
-        WHERE {TAKE_KEY} = ?
+        WHERE {TAKE_KEY} = {_lit(key)}
         ORDER BY labels.ab::VARCHAR NULLS FIRST, labels.question::VARCHAR, labels."column"::VARCHAR,
                  labels."repeat"::INTEGER, started_at
-    """, [key]).fetchall()
+    """).fetchall()
     keys = ["run_id", "prompt", "answer", "status", "error", "iterations", "duration_ms", "cost_usd", "labels"]
     out = []
     for row in rows:
