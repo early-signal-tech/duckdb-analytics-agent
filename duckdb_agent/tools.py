@@ -1,6 +1,7 @@
 """The tools Claude can call: definitions, catalog lookups, dispatch, and submit_answer."""
 
 import json
+import re
 
 import duckdb
 
@@ -374,6 +375,15 @@ def tables_touched(conn: duckdb.DuckDBPyConnection, name: str, tool_input: dict,
     return None
 
 
+# Tool-call markup inside a field's text: the model sometimes writes the next parameter
+# into the current string (summary ending in '</summary> <parameter name="key_findings">').
+# Strict mode can't catch it -- the value is still a string -- so the answer arrives with
+# its findings stuck in the summary.
+LEAKED_MARKUP = re.compile(
+    r"</?parameter\b|</?(?:summary|key_findings|caveats|supporting_sql)>"
+)
+
+
 def validate_answer(answer) -> str | None:
     """Return an error if a submit_answer input doesn't have the required shape, else None."""
     if not isinstance(answer, dict):
@@ -384,6 +394,14 @@ def validate_answer(answer) -> str | None:
         value = answer.get(key)
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             return f"submit_answer requires {key} as a list of strings."
+    for key in ("summary", "key_findings", "caveats", "supporting_sql"):
+        texts = [answer[key]] if key == "summary" else answer[key]
+        if any(LEAKED_MARKUP.search(text) for text in texts):
+            return (
+                f"submit_answer's {key} contains tool-call markup (like '<parameter name=...>'), "
+                "so other fields ended up inside it. Submit again with each field as its own "
+                "parameter and plain text inside."
+            )
     return None
 
 
