@@ -21,17 +21,19 @@ A SQL-to-LLM agent: Claude (Haiku 5.5) answers questions about DuckDB or DuckLak
    uv run agent_harness.py --stop-traces-server
    uv run agent_harness.py --help
    ```
-   `--db` takes a persistent DuckDB file (attached read-only) or a `ducklake:` URI. `--load FILE` (CSV, Parquet, or JSON; repeatable) builds an in-memory database with one table per file, named after the file (`Sales 2026.csv` becomes `sales_2026`); `--tpch [SCALE]` generates the TPC-H benchmark tables instead (scale factor 0.1 by default; the DuckDB `tpch` extension downloads on first use), and the two combine. Both are held in memory and gone when the run ends, unless you add `--save-db PATH`: it writes the data to a new DuckDB file instead (refusing to overwrite an existing one), then runs against it; add `--no-run` to just build the file. Reuse it with `--db PATH`. In-memory databases can't be attached read-only, so there the SQL read-only check is the only guard. Files and ducklake URIs are always attached read-only. Without `--table`, the agent finds tables itself. `--quiet` logs progress only and prints the answer; the default shows the full trace (SQL, thinking, results). Exit status is 0 when the run completes, 1 otherwise. Needs DuckDB 2.0 and Python 3.11+.
+   `--db` takes a persistent DuckDB file (attached read-only) or a `ducklake:` URI. `--load FILE` (CSV, Parquet, or JSON; repeatable) builds an in-memory database with one table per file, named after the file (`Sales 2026.csv` becomes `sales_2026`); `--tpch [SCALE]` generates the TPC-H benchmark tables instead (scale factor 0.1 by default; the DuckDB `tpch` extension downloads on first use), and the two combine. Both are held in memory and gone when the run ends, unless you add `--save-db PATH`: it writes the data to a new DuckDB file instead (refusing to overwrite an existing one), then runs against it; add `--no-run` to just build the file. Reuse it with `--db PATH`. In-memory databases can't be attached read-only, so there the SQL read-only check is the only write guard. Files and ducklake URIs are always attached read-only. Either way, once the data is open the connection is locked down: the agent's SQL can't read other files or URLs (no `read_csv('~/.env')`), only the data it was given and a DuckLake's own data files, and can't change settings, attach, or load extensions. Without `--table`, the agent finds tables itself. `--quiet` logs progress only and prints the answer; the default shows the full trace (SQL, thinking, results). Exit status is 0 when the run completes, 1 otherwise. Needs DuckDB 2.0 and Python 3.11+.
 
 ## Using it from Python
 
 ```python
 import duckdb
 from duckdb_agent import AgentConfig, connect_traces_db, run_agent
+from duckdb_agent.sources import lock_down
 
 conn = duckdb.connect()
 conn.execute("ATTACH 'ducklake:ducklake_prod' AS source (READ_ONLY)")  # always READ_ONLY
 conn.execute("USE source.gold")
+lock_down(conn)  # last: no other files or URLs, and no more ATTACH/SET on this connection
 
 result = run_agent(
     conn,
