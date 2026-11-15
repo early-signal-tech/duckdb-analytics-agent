@@ -58,8 +58,23 @@ def test_cost_long_prompt_rate_card_counts_cached_tokens():
     assert long == pytest.approx((1_000 * 0.50 + 100_000 * 0.05) / 1_000_000)
 
 
+@pytest.mark.parametrize("model, input_rate, output_rate", [
+    ("claude-sonnet-5-5", 2.00, 10.00),
+    ("claude-opus-5-5", 4.00, 20.00),
+])
+def test_cost_sonnet_and_opus(model, input_rate, output_rate):
+    # One rate card for the whole context (no long-prompt tier); cache reads 0.05x input.
+    cost = estimate_cost(model, usage(input=150_000, cache_write=10_000, cache_read=200_000, output=5_000))
+    assert cost == pytest.approx((
+        150_000 * input_rate
+        + 10_000 * input_rate * 1.25
+        + 200_000 * input_rate * 0.05
+        + 5_000 * output_rate
+    ) / 1e6)
+
+
 def test_cost_unknown_model_is_none():
-    assert estimate_cost("claude-opus-5-5", usage(input=100)) is None
+    assert estimate_cost("claude-unpriced", usage(input=100)) is None
 
 
 # --- per-call rows ---
@@ -144,7 +159,7 @@ def test_wrap_up_call_is_counted(conn, traces_conn):
 
 def test_unpriced_model_has_no_cost(conn, traces_conn):
     client = FakeClient(call(response("end_turn", text("ok")), "req_1", input=10, output=5))
-    result = run(conn, client, traces_conn, model="claude-opus-5-5")
+    result = run(conn, client, traces_conn, model="claude-unpriced")
     assert result.estimated_cost_usd is None
     cost = traces_conn.execute("SELECT estimated_cost_usd FROM agent_runs WHERE run_id = ?", [result.run_id]).fetchone()[0]
     assert cost is None

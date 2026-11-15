@@ -1,21 +1,29 @@
 """Token totals and cost estimates."""
 
 
-# USD per million tokens, for cost estimates in traces. Haiku 5.5 has two rate cards,
-# picked per request by prompt size (input + cache write + cache read tokens): up to
-# 100K tokens, and above. Cache reads cost 0.1x the input rate and 5-minute cache writes
-# 1.25x. Output includes thinking tokens. Models not listed get no estimate (None).
+# USD per million tokens, for cost estimates in traces (platform.claude.com pricing page,
+# checked 2026-11-15). Output includes thinking tokens. 5-minute cache writes cost 1.25x
+# the input rate on every model; cache reads are per model ("cache_read" multiplier).
+# Haiku 5.5 has two rate cards, picked per request by prompt size (input + cache write +
+# cache read tokens): up to 100K tokens, and above. Sonnet and Opus price their whole 1M
+# context at one rate. Models not listed get no estimate (None).
 # Estimates only: check the pricing page before budgeting on them.
 MODEL_PRICING = {
     "claude-haiku-5-5": {
+        "cache_read": 0.1,
         "long_prompt_threshold": 100_000,
         "standard": {"input": 0.10, "output": 0.50},
         "long_prompt": {"input": 0.50, "output": 2.50},
     },
+    "claude-sonnet-5-5": {
+        "cache_read": 0.05,
+        "standard": {"input": 2.00, "output": 10.00},
+    },
+    "claude-opus-5-5": {
+        "cache_read": 0.05,
+        "standard": {"input": 4.00, "output": 20.00},
+    },
 }
-
-
-CACHE_READ_MULTIPLIER = 0.1
 
 
 CACHE_WRITE_MULTIPLIER = 1.25  # 5-minute TTL (CACHE_CONTROL)
@@ -31,12 +39,13 @@ def estimate_cost(model: str, usage) -> float | None:
     cache_read = getattr(usage, "cache_read_input_tokens", None) or 0
     output_tokens = getattr(usage, "output_tokens", None) or 0
     prompt_tokens = input_tokens + cache_write + cache_read
-    rates = pricing["long_prompt" if prompt_tokens > pricing["long_prompt_threshold"] else "standard"]
+    threshold = pricing.get("long_prompt_threshold")
+    rates = pricing["long_prompt" if threshold is not None and prompt_tokens > threshold else "standard"]
     input_rate = rates["input"] / 1_000_000
     return (
         input_tokens * input_rate
         + cache_write * input_rate * CACHE_WRITE_MULTIPLIER
-        + cache_read * input_rate * CACHE_READ_MULTIPLIER
+        + cache_read * input_rate * pricing["cache_read"]
         + output_tokens * rates["output"] / 1_000_000
     )
 
