@@ -8,11 +8,11 @@ A SQL-to-LLM agent: Claude (Haiku 5.5) answers questions about DuckDB or DuckLak
 2. **Install.** `uv sync`
 3. **Run.**
    ```bash
-   uv run agent_harness.py                      # demo question on DuckLake prod (gold.events_rich_ml_gold)
-   uv run agent_harness.py --prompt "Which event types grew most last week?"
+   uv run agent_harness.py                      # demo question on TPC-H data (scale 0.1), in memory
+   uv run agent_harness.py --prompt "Which nation earned the most revenue in 1995?"
    uv run agent_harness.py --db analytics.duckdb --schema main --table orders --table customers
+   uv run agent_harness.py --db ducklake:my_catalog --schema my_schema   # a DuckLake catalog, read-only
    uv run agent_harness.py --load sales.csv --load customers.parquet   # in memory, this run only
-   uv run agent_harness.py --tpch --prompt "Top 5 customers by revenue?"   # TPC-H sample data, in memory
    uv run agent_harness.py --tpch --save-db tpch.duckdb --no-run   # build a reusable file, no API call
    uv run agent_harness.py --db tpch.duckdb                        # ...and use it from then on
    uv run agent_harness.py --effort high --structured --quiet
@@ -21,7 +21,7 @@ A SQL-to-LLM agent: Claude (Haiku 5.5) answers questions about DuckDB or DuckLak
    uv run agent_harness.py --stop-traces-server
    uv run agent_harness.py --help
    ```
-   `--db` takes a persistent DuckDB file (attached read-only) or a `ducklake:` URI. `--load FILE` (CSV, Parquet, or JSON; repeatable) builds an in-memory database with one table per file, named after the file (`Sales 2026.csv` becomes `sales_2026`); `--tpch [SCALE]` generates the TPC-H benchmark tables instead (scale factor 0.1 by default; the DuckDB `tpch` extension downloads on first use), and the two combine. Both are held in memory and gone when the run ends, unless you add `--save-db PATH`: it writes the data to a new DuckDB file instead (refusing to overwrite an existing one), then runs against it; add `--no-run` to just build the file. Reuse it with `--db PATH`. In-memory databases can't be attached read-only, so there the SQL read-only check is the only write guard. Files and ducklake URIs are always attached read-only. Either way, once the data is open the connection is locked down: the agent's SQL can't read other files or URLs (no `read_csv('~/.env')`), only the data it was given and a DuckLake's own data files, and can't change settings, attach, or load extensions. Without `--table`, the agent finds tables itself. `--quiet` logs progress only and prints the answer; the default shows the full trace (SQL, thinking, results). Exit status is 0 when the run completes, 1 otherwise. Needs DuckDB 2.0 and Python 3.11+.
+   With no `--db`, `--load`, or `--tpch`, the run uses TPC-H data at scale 0.1, in memory. `--db` takes a persistent DuckDB file (attached read-only) or a `ducklake:` URI. `--load FILE` (CSV, Parquet, or JSON; repeatable) builds an in-memory database with one table per file, named after the file (`Sales 2026.csv` becomes `sales_2026`); `--tpch [SCALE]` generates the TPC-H benchmark tables instead (scale factor 0.1 by default; the DuckDB `tpch` extension downloads on first use), and the two combine. Both are held in memory and gone when the run ends, unless you add `--save-db PATH`: it writes the data to a new DuckDB file instead (refusing to overwrite an existing one), then runs against it; add `--no-run` to just build the file. Reuse it with `--db PATH`. In-memory databases can't be attached read-only, so there the SQL read-only check is the only write guard. Files and ducklake URIs are always attached read-only. Either way, once the data is open the connection is locked down: the agent's SQL can't read other files or URLs (no `read_csv('~/.env')`), only the data it was given and a DuckLake's own data files, and can't change settings, attach, or load extensions. Without `--table`, the agent finds tables itself. `--quiet` logs progress only and prints the answer; the default shows the full trace (SQL, thinking, results). Exit status is 0 when the run completes, 1 otherwise. Needs DuckDB 2.0 and Python 3.11+.
 
 ## Using it from Python
 
@@ -31,14 +31,14 @@ from duckdb_agent import AgentConfig, connect_traces_db, run_agent
 from duckdb_agent.sources import lock_down
 
 conn = duckdb.connect()
-conn.execute("ATTACH 'ducklake:ducklake_prod' AS source (READ_ONLY)")  # always READ_ONLY
-conn.execute("USE source.gold")
+conn.execute("ATTACH 'ducklake:my_catalog' AS source (READ_ONLY)")  # always READ_ONLY
+conn.execute("USE source.my_schema")
 lock_down(conn)  # last: no other files or URLs, and no more ATTACH/SET on this connection
 
 result = run_agent(
     conn,
-    "Compare the most recent day against the prior day.",
-    tables="events_rich_ml_gold",          # optional: schemas to preload
+    "Which customers placed the most orders this year?",
+    tables="orders",                       # optional: tables to preload
     config=AgentConfig(effort="medium"),   # model, effort, limits, features
     traces_conn=connect_traces_db("agent_traces.duckdb"),  # or init_traces_db: the file, no server
 )
@@ -197,6 +197,20 @@ For in-memory sources (`--load`, `--tpch` without `--save-db`) the script says s
 
 The traces hold SQL, results, and answers, so protect the file like the data itself. A traces file from before DuckDB 2.0 is refused with a pointer to `--reset-traces`.
 
+## Evaluations
+
+The agent is evaluated on the 22 standard [TPC-H](https://www.tpc.org/tpch/) queries, each with a known correct answer:
+
+- [EVAL_QUESTIONS.md](EVAL_QUESTIONS.md): how to set up, run, and grade the eval. It has the questions by category, the expected result for each at scale factor 0.1, a batch runner, and trace queries for scoring.
+- [TPCH_QUESTIONS.md](TPCH_QUESTIONS.md): the questions with their reference SQL, the same set the DH-1 TPC-H set is built from.
+
+```bash
+uv run agent_harness.py --tpch --save-db tpch.duckdb --no-run   # once: builds the scale 0.1 data
+uv run agent_harness.py --db tpch.duckdb --quiet --prompt "<one of the 22 questions>"
+```
+
+Each question is graded on Correct (the numbers match the reference), Careful (it states the assumptions the question needs), and Efficient (from the traces). Check the scale before comparing numbers: the expected values are for 0.1, and the DH-1 built-in set runs at 0.01.
+
 ## Tests
 
 ```bash
@@ -208,8 +222,11 @@ uv run pytest --cov=duckdb_agent --cov-branch    # with coverage
 
 ```
 ├── agent_harness.py       command-line entry point
-├── duckdb_agent/          the agent package (traces_server.py: the Quack server; serve.py: the app protocol)
+├── duckdb_agent/          the agent package (traces_server.py: the Quack server; serve.py: the app protocol;
+│                          sources.py: the data it opens, including TPC-H and DuckLake)
 ├── tests/                 pytest suite
+├── EVAL_QUESTIONS.md      how to run and grade the TPC-H eval
+├── TPCH_QUESTIONS.md      the 22 TPC-H questions with their reference SQL
 ├── .env.example           environment template
 └── pyproject.toml / uv.lock
 ```

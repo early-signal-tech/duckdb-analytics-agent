@@ -25,11 +25,11 @@ def db(tmp_path):
     return str(path)
 
 
-def test_defaults_target_ducklake_prod():
+def test_defaults_are_tpch_in_memory():
     args = agent_harness.parse_args([])
-    assert args.db == "ducklake:ducklake_prod"
-    assert args.schema == "gold"
-    assert args.tables == ["events_rich_ml_gold"]
+    assert args.db == ":memory:" and args.tpch == agent_harness.DEFAULT_TPCH_SCALE == 0.1
+    assert args.schema is None and args.tables is None and args.load == []
+    assert args.prompt == agent_harness.DEFAULT_PROMPT
     assert args.effort == "medium" and not args.quiet and not args.structured
 
 
@@ -44,15 +44,32 @@ def test_repeatable_tables_and_settings():
     assert (args.effort, args.max_iterations) == ("high", 5)
 
 
-def test_no_table_skips_the_default_preload():
-    args = agent_harness.parse_args(["--no-table"])
-    assert args.tables is None
-    assert args.schema == "gold"
+def test_naming_a_file_turns_off_the_tpch_default(db):
+    args = agent_harness.parse_args(["--db", db])
+    assert args.db == db and args.tpch is None
 
 
-def test_no_table_conflicts_with_table():
+def test_load_turns_off_the_tpch_default(tmp_path):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("amount\n10\n")
+    args = agent_harness.parse_args(["--load", str(csv)])
+    assert args.db == ":memory:" and args.tpch is None
+
+
+def test_save_db_defaults_to_tpch(tmp_path):
+    path = str(tmp_path / "new.duckdb")
+    args = agent_harness.parse_args(["--save-db", path, "--no-run"])
+    assert args.db == path and args.tpch == 0.1
+
+
+def test_save_db_conflicts_with_db(db):
     with pytest.raises(SystemExit):
-        agent_harness.parse_args(["--no-table", "--table", "a"])
+        agent_harness.parse_args(["--save-db", "x.duckdb", "--db", db])
+
+
+def test_no_table_flag_is_gone():
+    with pytest.raises(SystemExit):
+        agent_harness.parse_args(["--no-table"])
 
 
 def test_invalid_effort_is_rejected():
@@ -151,7 +168,6 @@ def test_save_db_refuses_to_overwrite(tmp_path):
 
 
 @pytest.mark.parametrize("argv", [
-    ["--save-db", "x.duckdb"],                      # nothing to save
     ["--tpch", "--save-db", "x.duckdb", "--db", "y.duckdb"],
     ["--no-run"],
 ])
@@ -186,3 +202,21 @@ def test_traces_shell_accepts_a_matching_cli(tmp_path):
 
 def test_traces_shell_lets_an_unreadable_version_through(tmp_path):
     assert agent_harness.cli_version_problem(_fake_cli(tmp_path, "something odd")) is None
+
+
+def test_no_arguments_runs_on_tpch_in_memory(tmp_path, capsys):
+    """With no data named, the run uses TPC-H at the default scale, in memory, with no tables preloaded."""
+    client = FakeClient(
+        response("tool_use", tool_use("SELECT count(*) AS n FROM lineitem")),
+        response("end_turn", text("Counted line items.")),
+    )
+    traces = str(tmp_path / "traces.duckdb")
+    status = agent_harness.main(["--quiet", "--traces-db", traces, "--no-traces-server"], client=client)
+    assert status == 0
+    assert capsys.readouterr().out.strip() == "Counted line items."
+    conn = duckdb.connect(traces)
+    try:
+        assert conn.execute("SELECT data_source.tpch::DOUBLE FROM agent_runs").fetchone() == (0.1,)
+        assert conn.execute("SELECT table_names FROM tool_calls WHERE input_sql IS NOT NULL").fetchone() == (['main.lineitem'],)
+    finally:
+        conn.close()

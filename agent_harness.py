@@ -1,8 +1,9 @@
 """Run the agent from the command line against a DuckDB file or DuckLake catalog.
 
-    uv run agent_harness.py                                  # the demo question on DuckLake prod
-    uv run agent_harness.py --prompt "Which event types grew most last week?"
+    uv run agent_harness.py                                  # the demo question on TPC-H data (scale 0.1), in memory
+    uv run agent_harness.py --prompt "Which nation earned the most revenue in 1995?"
     uv run agent_harness.py --db analytics.duckdb --schema main --table orders --table customers
+    uv run agent_harness.py --db ducklake:my_catalog --schema my_schema   # any DuckLake catalog, read-only
     uv run agent_harness.py --load sales.csv --load customers.parquet   # in memory, this run only
     uv run agent_harness.py --tpch                           # TPC-H sample data in memory
     uv run agent_harness.py --tpch --save-db tpch.duckdb --no-run   # build a reusable file
@@ -37,9 +38,7 @@ from duckdb_agent.sources import (  # noqa: F401
     DEFAULT_TPCH_SCALE, IN_MEMORY, build_database, connect, populate, table_name_for,
 )
 
-DEFAULT_PROMPT = (
-    "Compare the most recent day of data against the prior day and run the most important analysis on it."
-)
+DEFAULT_PROMPT = "Who are the top 5 customers by revenue, and how much revenue is each one responsible for?"
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -48,17 +47,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--table", action="append", dest="tables", metavar="TABLE",
         help="A table to focus on; its schema is preloaded. Repeatable. "
-             "Default: events_rich_ml_gold when using the default --db; otherwise none "
-             "(the agent finds tables with list_tables)."
+             "Default: none (the agent finds tables with list_tables)."
     )
     parser.add_argument(
-        "--no-table", action="store_true",
-        help="Preload no schema, even with the default --db: the agent must find tables with list_tables."
-    )
-    parser.add_argument(
-        "--db", default="ducklake:ducklake_prod",
+        "--db", default=None,
         help="Database to attach read-only: a DuckDB file path or a ducklake: URI. "
-             "Default: ducklake:ducklake_prod."
+             "Default: the TPC-H benchmark data (see --tpch), in memory."
     )
     parser.add_argument(
         "--load", action="append", dest="load", metavar="FILE", default=[],
@@ -69,8 +63,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--tpch", nargs="?", type=float, const=DEFAULT_TPCH_SCALE, metavar="SCALE",
         help="Generate the TPC-H benchmark tables (customer, orders, lineitem, ...) in memory. "
-             f"Optional scale factor, default {DEFAULT_TPCH_SCALE}. Needs the DuckDB tpch extension, "
-             "downloaded on first use. Can be combined with --load."
+             f"Optional scale factor, default {DEFAULT_TPCH_SCALE}. This is what runs when no data is named "
+             "(no --db, --load, or --tpch). Needs the DuckDB tpch extension, downloaded on first use. "
+             "Can be combined with --load."
     )
     parser.add_argument(
         "--save-db", metavar="PATH",
@@ -81,7 +76,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--no-run", action="store_true",
         help="With --save-db: build the database file and exit without calling Claude."
     )
-    parser.add_argument("--schema", help="Schema to USE in that database. Default: gold for the default --db.")
+    parser.add_argument("--schema", help="Schema to USE in that database. Default: none (the database's default schema).")
     parser.add_argument("--traces-db", default="agent_traces.duckdb", help="Where to write traces.")
     parser.add_argument(
         "--reset-traces", action="store_true",
@@ -113,29 +108,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Log progress and metadata only (no SQL, thinking, or results), then print the answer."
     )
     args = parser.parse_args(argv)
-    has_data = bool(args.load) or args.tpch is not None
     if args.no_run and not args.save_db:
         parser.error("--no-run needs --save-db")
     if args.save_db:
-        if not has_data:
-            parser.error("--save-db needs --load or --tpch to put in the file")
-        if args.db != parser.get_default("db"):
+        if args.db is not None:
             parser.error("--save-db and --db can't be used together; use --db to reuse the file later")
         if Path(args.save_db).exists():
             parser.error(f"{args.save_db} already exists; delete it or pick another path")
-        args.db = args.save_db
-    elif has_data and args.db == parser.get_default("db"):
-        args.db = IN_MEMORY
-    if has_data and not args.save_db and args.db != IN_MEMORY:
-        parser.error("--load and --tpch need an in-memory database; drop --db or use --db :memory:")
+    # No data named: the TPC-H benchmark data at the default scale, in memory.
+    if not args.load and args.tpch is None and args.db in (None, IN_MEMORY):
+        args.tpch = DEFAULT_TPCH_SCALE
     if args.tpch is not None and args.tpch <= 0:
         parser.error("--tpch scale factor must be positive")
-    if args.no_table and args.tables:
-        parser.error("--no-table and --table can't be used together")
-    if args.db == parser.get_default("db"):
-        args.schema = args.schema or "gold"
-        if not args.no_table:
-            args.tables = args.tables or ["events_rich_ml_gold"]
+    if args.save_db:
+        args.db = args.save_db
+    elif args.db in (None, IN_MEMORY):
+        args.db = IN_MEMORY
+    elif args.load or args.tpch is not None:
+        parser.error("--load and --tpch need an in-memory database; drop --db or use --db :memory:")
     return args
 
 
