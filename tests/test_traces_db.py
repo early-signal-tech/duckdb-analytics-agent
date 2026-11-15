@@ -108,10 +108,10 @@ def test_a_source_duckdb_cant_name_is_recorded_as_attached(traces_conn):
     conn = duckdb.connect()
     conn.execute("CREATE TABLE t AS SELECT 1 AS a")
     client = FakeClient(response("tool_use", tool_use("SELECT a FROM t")), response("end_turn", text("1")))
-    result = run_agent(conn, "q", client=client, traces_conn=traces_conn, source_db="ducklake:ducklake_prod")
+    result = run_agent(conn, "q", client=client, traces_conn=traces_conn, source_db="ducklake:my_catalog")
     assert traces_conn.execute(
         "SELECT source_db FROM agent_runs WHERE run_id = ?", [result.run_id]
-    ).fetchone()[0] == "ducklake:ducklake_prod"
+    ).fetchone()[0] == "ducklake:my_catalog"
 
 
 def test_replay_script_runs_in_a_fresh_session(tmp_path, traces_conn):

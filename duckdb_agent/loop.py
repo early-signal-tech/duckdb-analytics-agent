@@ -150,7 +150,7 @@ def run_agent(
 
     `source_db` is the database as the caller attached it (a file path or ducklake:
     URI). It's recorded as agent_runs.source_db when DuckDB can't report the path
-    itself, as with a DuckLake attached through a secret (ducklake:ducklake_prod).
+    itself, as with a DuckLake attached through a secret (ducklake:my_catalog).
     `data_source` is the data as the caller asked for it ({db, schema}, {load}, or
     {tpch}, see tracing.request_data_source), recorded as agent_runs.data_source so the
     same data can be opened again.
