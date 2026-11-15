@@ -54,12 +54,49 @@ def use_statement(db: str, schema: str | None) -> str | None:
     return "USE source" + (f'."{schema}"' if schema else "")
 
 
+# Data paths that need an extension to read. Once lock_down runs, extensions can't
+# autoload, so the one a remote DuckLake needs is loaded first.
+REMOTE_EXTENSIONS = {
+    "s3://": "httpfs", "s3a://": "httpfs", "r2://": "httpfs", "gs://": "httpfs", "gcs://": "httpfs",
+    "http://": "httpfs", "https://": "httpfs", "hf://": "httpfs", "az://": "azure", "abfss://": "azure",
+}
+
+
+def lock_down(conn: duckdb.DuckDBPyConnection) -> None:
+    """Keep the agent's SQL inside the data it was given.
+
+    READ_ONLY stops writes, and the read-only check allows only SELECTs, but a SELECT
+    can still read any file or URL (read_csv('~/.env'), FROM 'https://...'). This turns
+    off external access, leaving only the data files of attached DuckLakes reachable,
+    and locks the configuration so SQL can't turn it back on. Call it after attaching
+    and populating: from here on, nothing can be attached, loaded, or installed.
+    Cursors of this connection share the settings.
+    """
+    allowed = []
+    for (catalog,) in conn.execute("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'").fetchall():
+        data_path = conn.execute("SELECT data_path FROM ducklake_settings(?)", [catalog]).fetchone()[0]
+        if not data_path:
+            continue
+        allowed.append(data_path)
+        extension = next(
+            (ext for prefix, ext in REMOTE_EXTENSIONS.items() if data_path.lower().startswith(prefix)), None
+        )
+        if extension:
+            conn.execute(f"INSTALL {extension}")
+            conn.execute(f"LOAD {extension}")
+    if allowed:
+        conn.execute("SET allowed_directories = ?", [allowed])
+    conn.execute("SET enable_external_access = false")
+    conn.execute("SET lock_configuration = true")
+
+
 def connect(db: str, schema: str | None, load: list[str] = (), tpch: float | None = None) -> duckdb.DuckDBPyConnection:
     """Open the database for the agent.
 
     A file or ducklake: URI is attached READ_ONLY, so DuckDB rejects writes whatever SQL
     Claude sends. ":memory:" can't be read-only (it starts empty), so it is populated
-    (see `populate`) and the SQL read-only check is the guard.
+    (see `populate`) and the SQL read-only check is the guard. Either way the connection
+    is then locked down (see `lock_down`), so queries can't read other files or URLs.
     """
     conn = duckdb.connect()
     if db == IN_MEMORY:
@@ -69,4 +106,5 @@ def connect(db: str, schema: str | None, load: list[str] = (), tpch: float | Non
     use = use_statement(db, schema)
     if use:
         conn.execute(use)
+    lock_down(conn)
     return conn
