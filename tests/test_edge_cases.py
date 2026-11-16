@@ -152,3 +152,16 @@ def test_select_cannot_read_local_files(conn, tmp_path):
     secret.write_text("password\nhunter2\n")
     result = execute_query(conn, f"SELECT * FROM read_csv('{secret}')")
     assert result["success"] is False
+
+
+# --- timezone-aware timestamps (needs pytz) ---
+
+def test_timestamptz_values_come_back_from_queries_and_samples():
+    conn = duckdb.connect()
+    conn.execute("CREATE TABLE events AS SELECT TIMESTAMPTZ '2026-11-15 10:00:00+00' AS happened_at, 1 AS id")
+    result = execute_query(conn, "SELECT happened_at FROM events")
+    assert result["success"], result.get("error")
+    assert result["rows"][0][0].startswith("2026-11-15")
+    sample = sample_rows(conn, "events")
+    assert sample["success"], sample.get("error")
+    assert sample["row_count"] == 1

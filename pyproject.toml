@@ -10,6 +10,9 @@ dependencies = [
     # 2.0: Quack (the traces server) and VARIANT trace columns. Needs Python 3.11+.
     "duckdb>=2.0.0",
     "python-dotenv>=1.0.0",
+    # DuckDB needs it to return TIMESTAMPTZ values (timezone-aware datetimes); without
+    # it, any query or sample touching such a column fails.
+    "pytz>=2024.1",
 ]
 
 [project.scripts]
