@@ -40,6 +40,14 @@ Requests:
         -> {"id": "k", "type": "take", "runs": [{run_id, prompt, answer, status, error,
             iterations, duration_ms, cost_usd, labels}, ...]}
         A take is one press of PLAY in the rack: a run, an A/B pair, or a setlist (takes.py).
+    {"id": "z", "type": "secrets"}
+        -> {"id": "z", "type": "secrets", "secrets": [{name, type, provider, scope}, ...]}
+    {"id": "z", "type": "secret_create", "name": "s3_main", "secret_type": "s3",
+     "values": {"KEY_ID": "...", "SECRET": "..."}, "scope": "s3://bucket" | null, "replace": false}
+    {"id": "z", "type": "secret_drop", "name": "s3_main"}
+        -> both reply like "secrets", with the list as it is now.
+        DuckDB's persistent secrets (duckdb_secrets.py): values go in, never out. hello's
+        "secret_types" lists each type's fields, for a form.
     {"id": "q", "type": "shutdown"}                -> {"id": "q", "type": "ok"}, then exit
 traces_stop stops the background traces server (the next run starts it again);
 traces_reset deletes the traces database. Both are refused while runs are active.
@@ -63,7 +71,7 @@ import anthropic
 import duckdb
 from dotenv import load_dotenv
 
-from . import package_version
+from . import duckdb_secrets, package_version
 from .config import API_MAX_RETRIES, DEFAULT_CONFIG, EFFORT_LEVELS, MAX_NON_STREAMING_TOKENS, TOOL_NAMES, AgentConfig
 from .log import configure_logging, logger
 from .loop import run_agent
@@ -251,6 +259,7 @@ class Server:
                 # context_protected_tools can name.
                 "limits": {"max_tokens": MAX_NON_STREAMING_TOKENS},
                 "tools": list(TOOL_NAMES),
+                "secret_types": duckdb_secrets.SECRET_TYPES,
             })
         elif kind in ("takes", "take"):
             self.handle_takes(request_id, request)
@@ -266,6 +275,8 @@ class Server:
                 self.send({"id": request_id, "type": "ok"})
         elif kind in ("traces", "traces_stop", "traces_reset"):
             self.handle_traces(request_id, kind)
+        elif kind in ("secrets", "secret_create", "secret_drop"):
+            self.handle_secrets(request_id, request)
         elif kind == "shutdown":
             self.stop_all()
             self.send({"id": request_id, "type": "ok"})
@@ -318,6 +329,29 @@ class Server:
         finally:
             if traces is not None:
                 traces.close()
+
+    def handle_secrets(self, request_id: str, request: dict) -> None:
+        """List, create, or drop a persistent DuckDB secret; reply with the list. Values
+        are never logged or sent back (duckdb_secrets.py)."""
+        kind = request["type"]
+        try:
+            conn = duckdb_secrets.connect()
+        except duckdb.Error as e:
+            self.send_error(request_id, f"could not open DuckDB: {e}")
+            return
+        try:
+            if kind == "secret_create":
+                duckdb_secrets.create_secret(
+                    conn, request.get("name"), request.get("secret_type"), request.get("values") or {},
+                    scope=request.get("scope"), replace=request.get("replace") is True,
+                )
+            elif kind == "secret_drop":
+                duckdb_secrets.drop_secret(conn, request.get("name"))
+            self.send({"id": request_id, "type": "secrets", "secrets": duckdb_secrets.list_secrets(conn)})
+        except duckdb_secrets.SecretError as e:
+            self.send_error(request_id, str(e))
+        finally:
+            conn.close()
 
     def handle_traces(self, request_id: str, kind: str) -> None:
         if kind == "traces":
