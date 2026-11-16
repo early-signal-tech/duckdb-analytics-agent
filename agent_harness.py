@@ -4,6 +4,7 @@
     uv run agent_harness.py --prompt "Which nation earned the most revenue in 1995?"
     uv run agent_harness.py --db analytics.duckdb --schema main --table orders --table customers
     uv run agent_harness.py --db ducklake:my_catalog --schema my_schema   # any DuckLake catalog, read-only
+    uv run agent_harness.py --db 's3://bucket/orders/*.parquet'          # S3 files, read in place
     uv run agent_harness.py --load sales.csv --load customers.parquet   # in memory, this run only
     uv run agent_harness.py --tpch                           # TPC-H sample data in memory
     uv run agent_harness.py --tpch --save-db tpch.duckdb --no-run   # build a reusable file
@@ -51,7 +52,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--db", default=None,
-        help="Database to attach read-only: a DuckDB file path or a ducklake: URI. "
+        help="Data to open read-only: a DuckDB file (local, or remote like s3://bucket/sales.duckdb), "
+             "a ducklake: URI, or remote data files queried in place (s3://bucket/orders/*.parquet, "
+             "or a folder of Parquet: s3://bucket/orders/). Remote paths use your DuckDB secrets. "
              "Default: the TPC-H benchmark data (see --tpch), in memory."
     )
     parser.add_argument(

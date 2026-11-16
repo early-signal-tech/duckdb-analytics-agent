@@ -98,7 +98,8 @@ class RequestError(ValueError):
 
 def parse_source(source) -> dict:
     """Normalize a run's "source" into {db, schema, load, tpch}, with the CLI's rules:
-    loaded files and TPC-H live in memory; a db file or ducklake: URI is attached read-only."""
+    loaded files and TPC-H live in memory; a db file or ducklake: URI is attached read-only;
+    remote data files (s3://bucket/orders/*.parquet) become a view (sources.connect)."""
     if not isinstance(source, dict):
         raise RequestError('"source" must be an object, e.g. {"db": "tpch.duckdb"}')
     unknown = set(source) - SOURCE_FIELDS
