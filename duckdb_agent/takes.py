@@ -19,12 +19,7 @@ Values go into the SQL as quoted literals, not as parameters: through the traces
 
 import json
 
-from .tracing import TracesDB
-
-
-def _lit(value: str) -> str:
-    """A string as a SQL literal."""
-    return "'" + value.replace("'", "''") + "'"
+from .tracing import TracesDB, sql_literal as _lit
 
 
 TAKE_KEY = "coalesce(labels.setlist_run::VARCHAR, labels.pair::VARCHAR, run_id)"

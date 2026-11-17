@@ -13,6 +13,7 @@ Modules:
     sql           read-only check, query execution, timeouts, cancellation, result-size limits
     sources       opening the data: DuckDB files, ducklake: URIs, loaded files, TPC-H
     serve         JSON Lines protocol on stdin/stdout, for the desktop app
+    follow_up     follow-up questions: the earlier turns, read from the traces, as a digest
     takes         what a rack played (runs, A/B pairs, setlists), read from the traces
     prompts       system prompt and wrap-up instructions
     tracing       traces database schema, TracesDB, and writers
@@ -25,6 +26,7 @@ Modules:
 from importlib.metadata import PackageNotFoundError, version as _version
 
 from .config import DEFAULT_CONFIG, AgentConfig
+from .follow_up import MAX_TURNS, FollowUpError
 from .log import configure_logging
 from .loop import AgentResult, run_agent
 from .traces_server import TracesServerOutdated, connect_traces_db, stop_traces_server
@@ -43,6 +45,8 @@ __all__ = [
     "AgentConfig",
     "AgentResult",
     "DEFAULT_CONFIG",
+    "FollowUpError",
+    "MAX_TURNS",
     "SCHEMA_VERSION",
     "TracesDB",
     "TracesServerOutdated",

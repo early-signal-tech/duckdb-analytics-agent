@@ -19,7 +19,8 @@ Requests:
      "source": {"db": "tpch.duckdb", "schema": null} | {"load": ["a.csv"], "tpch": 0.1},
      "tables": ["orders"], "config": {"effort": "high", "max_iterations": 10, ...},
      "preset": {"id": "…", "name": "Balanced", "revision": 3, "modified": false},
-     "labels": {"setlist": "tpch", "question": "Q3"}}
+     "labels": {"setlist": "tpch", "question": "Q3"},
+     "parent_run_id": "<an earlier run's run_id>"}
         -> {"id": "r1", "type": "accepted"}
         -> {"id": "r1", "type": "event", "event": "<name>", "run_id": ..., ...}  (many; see
            EventCallback in loop.py)
@@ -52,7 +53,10 @@ Requests:
 traces_stop stops the background traces server (the next run starts it again);
 traces_reset deletes the traces database. Both are refused while runs are active.
 "preset" and "labels" are optional and don't change the run; they're recorded with it in
-agent_runs (see run_agent). A bad request gets {"id": ..., "type": "error", "error": "..."}; a run that fails before
+agent_runs (see run_agent). "parent_run_id" makes the run a follow-up to that run (see
+follow_up.py; needs traces): with no "source", it runs on the parent's data. A follow-up
+that breaks the rules (unknown parent, too many turns, switching to loaded files or
+TPC-H data) gets an error in place of its result. A bad request gets {"id": ..., "type": "error", "error": "..."}; a run that fails before
 it starts (a missing file, a bad db path) gets the same in place of its result.
 
 Runs execute in parallel threads (for A/B), each on its own DuckDB connection. Data is
@@ -74,6 +78,7 @@ from dotenv import load_dotenv
 from . import duckdb_secrets, package_version
 from .config import API_MAX_RETRIES, DEFAULT_CONFIG, EFFORT_LEVELS, MAX_NON_STREAMING_TOKENS, TOOL_NAMES, AgentConfig
 from .log import configure_logging, logger
+from .follow_up import FollowUpError, parent_source
 from .loop import run_agent
 from .serialization import json_dumps
 from .sources import IN_MEMORY, connect, use_statement
@@ -380,12 +385,23 @@ class Server:
             prompt = request.get("prompt")
             if not isinstance(prompt, str) or not prompt.strip():
                 raise RequestError('"prompt" must be a non-empty string')
-            source = parse_source(request.get("source"))
+            parent_run_id = request.get("parent_run_id")
+            if parent_run_id is not None and (not isinstance(parent_run_id, str) or not parent_run_id):
+                raise RequestError('"parent_run_id" must be a run id')
+            if parent_run_id is not None and self.traces_path is None:
+                raise RequestError("a follow-up reads the earlier run from the traces, and traces are off")
+            source = request.get("source")
+            if source is None and parent_run_id is not None:
+                source = self.parent_source(parent_run_id)
+            source = parse_source(source)
             config = parse_config(request.get("config"))
             tables = request.get("tables")
             if tables is not None and (not isinstance(tables, list) or not all(isinstance(t, str) for t in tables)):
                 raise RequestError('"tables" must be a list of table names')
-            recorded = {"preset": parse_preset(request.get("preset")), "labels": parse_labels(request.get("labels"))}
+            recorded = {
+                "preset": parse_preset(request.get("preset")), "labels": parse_labels(request.get("labels")),
+                "parent_run_id": parent_run_id,
+            }
         except RequestError as e:
             self.send_error(request_id, str(e))
             return
@@ -402,6 +418,20 @@ class Server:
             self._runs[request_id] = {"thread": thread, "cancel": cancel}
         self.send({"id": request_id, "type": "accepted"})
         thread.start()
+
+    def parent_source(self, parent_run_id: str) -> dict:
+        """The data a follow-up's parent ran on, as a request's "source"."""
+        traces = None
+        try:
+            traces = self.traces()
+            if traces is None:
+                raise RequestError("a follow-up reads the earlier run from the traces, and traces are off")
+            return parent_source(traces, parent_run_id)
+        except FollowUpError as e:
+            raise RequestError(str(e)) from None
+        finally:
+            if traces is not None:
+                traces.close()
 
     def execute_run(self, request_id, prompt, source, tables, config, cancel, recorded=None) -> None:
         conn = traces_conn = None
@@ -422,6 +452,10 @@ class Server:
                 **(recorded or {})
             )
             self.send({"id": request_id, "type": "result", "result": dataclasses.asdict(result)})
+        except FollowUpError as e:
+            # Refused before it started: nothing was traced.
+            logger.warning("Run %s: %s", request_id, e)
+            self.send_error(request_id, str(e))
         except Exception as e:
             # run_agent already wrote its summary (and a run_end event); say it ended.
             logger.exception("Run %s failed", request_id)
