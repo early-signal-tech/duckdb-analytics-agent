@@ -231,3 +231,7 @@ uv run pytest --cov=duckdb_agent --cov-branch    # with coverage
 ├── .env.example           environment template
 └── pyproject.toml / uv.lock
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
