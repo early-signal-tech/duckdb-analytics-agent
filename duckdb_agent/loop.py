@@ -12,6 +12,7 @@ from datetime import datetime
 
 from .config import API_MAX_RETRIES, AgentConfig, CACHE_CONTROL, CONTEXT_MANAGEMENT_BETA, DEFAULT_CONFIG, THINKING
 from .log import logger
+from .follow_up import FollowUp, FollowUpError, build_follow_up
 from .prompts import MAX_ITERATIONS_WRAP_UP_PROMPT, build_system_prompt
 from .serialization import json_dumps
 from .sql import tool_error
@@ -26,7 +27,8 @@ from .usage import MODEL_PRICING, USAGE_FIELDS, add_usage, estimate_cost
 # Live progress for a UI. run_agent(on_event=...) calls the callback with one dict per
 # event: {"event": <name>, "run_id": ..., **fields}. Every value is JSON-ready. Events:
 #   run_start        model, effort, tables, prompt, config (AgentConfig.to_dict()),
-#                    preset, labels (as passed to run_agent; None when not given)
+#                    preset, labels (as passed to run_agent; None when not given),
+#                    parent_run_id (the run this one follows up on, or None)
 #   api_call_start   iteration
 #   api_call         iteration, latency_ms, stop_reason, request_id, usage (this call),
 #                    cost_usd (this call), context_tokens (prompt size of this call:
@@ -127,6 +129,7 @@ def run_agent(
     labels: dict | None = None,
     source_db: str | None = None,
     data_source: dict | None = None,
+    parent_run_id: str | None = None,
 ) -> AgentResult:
     """Run the SQL-to-LLM agent loop.
 
@@ -155,6 +158,12 @@ def run_agent(
     {tpch}, see tracing.request_data_source), recorded as agent_runs.data_source so the
     same data can be opened again.
 
+    `parent_run_id` makes this a follow-up to that run: the conversation so far is read
+    from `traces_conn` and put in the first message as a digest (see follow_up.py). It
+    raises FollowUpError before the run starts (nothing is traced) if the parent isn't a
+    finished run, the conversation is already follow_up.MAX_TURNS questions long, or
+    the data switches to loaded files or TPC-H data.
+
     API failures end the run with status "api_error" instead of raising. Any other
     exception (a bug, Ctrl-C) is re-raised, but the run summary is written first.
     """
@@ -167,6 +176,15 @@ def run_agent(
     source = describe_source(conn)  # what database the SQL runs against, for replaying it
     if not source["source_db"] and source_db:
         source["source_db"] = source_db
+    follow_up = None
+    if parent_run_id is not None:
+        if traces_conn is None:
+            raise FollowUpError("a follow-up reads the earlier run from the traces; pass traces_conn")
+        # A caller that didn't say what data this is (a library caller with its own
+        # connection) is on the database it's connected to.
+        if data_source is None and source["source_db"]:
+            data_source = {"db": source["source_db"]}
+        follow_up = build_follow_up(traces_conn, parent_run_id, data_source)
     started_at, start_clock = datetime.now(), time.monotonic()
     # Shared with the loop. cost stays None for models without pricing.
     progress = {
@@ -232,6 +250,7 @@ def run_agent(
                 config=config.to_dict(),
                 preset=preset,
                 labels=labels,
+                parent_run_id=parent_run_id,
                 source=source,
                 data_source=data_source,
                 answer_tables=answer_tables,
@@ -256,15 +275,20 @@ def run_agent(
 
     try:
         emit("run_start", model=config.model, effort=config.effort, tables=tables, prompt=prompt,
-             config=config.to_dict(), preset=preset, labels=labels)
+             config=config.to_dict(), preset=preset, labels=labels, parent_run_id=parent_run_id)
         if traces_conn:
             # Logged first, so readers can see a run in progress (agent_runs is written
             # at the end) and replay its SQL against the right database.
             log_trace(traces_conn, run_id, 0, "run_start", details={
-                **source, "model": config.model, "tables": tables, "prompt": prompt
+                **source, "model": config.model, "tables": tables, "prompt": prompt,
+                "parent_run_id": parent_run_id,
             })
+            if follow_up:
+                # Which turns went into the digest; the text itself is rebuilt from them.
+                log_trace(traces_conn, run_id, 0, "follow_up_context", details=follow_up.details())
         return _run_agent_loop(
-            conn, tables, prompt, config, traces_conn, client, run_id, finish, progress, emit, cancel
+            conn, tables, prompt, config, traces_conn, client, run_id, finish, progress, emit, cancel,
+            follow_up
         )
     except BaseException as e:
         if not summary_written:
@@ -288,7 +312,8 @@ def _run_agent_loop(
     finish,
     progress: dict,
     emit,
-    cancel: threading.Event | None
+    cancel: threading.Event | None,
+    follow_up: FollowUp | None = None
 ) -> AgentResult:
     logger.info("\n%s\nStarting agent loop (Run ID: %s, model: %s, effort: %s)\n%s",
                 "=" * 60, run_id, config.model, config.effort, "=" * 60)
@@ -337,7 +362,9 @@ def _run_agent_loop(
     messages = [
         {
             "role": "user",
-            "content": "".join(f"{block}\n\n" for block in table_blocks)
+            # A follow-up's earlier turns come first, then the focus tables, then the question.
+            "content": (f"{follow_up.text}\n\n" if follow_up else "")
+                      + "".join(f"{block}\n\n" for block in table_blocks)
                       + f"<question>\n{prompt}\n</question>"
         }
     ]

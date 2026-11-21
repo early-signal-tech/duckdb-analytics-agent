@@ -44,6 +44,9 @@ TRACES_TABLES = {
         # for grouping runs (a setlist, a question, a repeat), NULL when there are none.
         "preset": "VARIANT",
         "labels": "VARIANT",
+        # The run this one follows up on (see follow_up.py); NULL for a new question.
+        # A conversation is the chain of parent_run_id links.
+        "parent_run_id": "VARCHAR",
         # The database the agent's SQL ran against (see describe_source).
         "source_db": "VARCHAR",
         "source_catalog": "VARCHAR",
@@ -224,6 +227,12 @@ TABLE_CHOICES_VIEW = """
 SCHEMA_VERSION = hashlib.sha256(
     (repr(TRACES_TABLES) + REPLAY_SQL_VIEW + TABLE_CHOICES_VIEW).encode()
 ).hexdigest()[:12]
+
+
+def sql_literal(value: str) -> str:
+    """A string as a SQL literal, for reads through the traces server (Quack doesn't
+    forward query parameters)."""
+    return "'" + value.replace("'", "''") + "'"
 
 
 class TracesSchemaError(Exception):
@@ -470,6 +479,7 @@ def log_run_summary(
     config: dict = None,
     preset: dict = None,
     labels: dict = None,
+    parent_run_id: str = None,
     source: dict = None,
     data_source: dict = None,
     answer_tables: list[str] = None,
@@ -499,6 +509,7 @@ def log_run_summary(
         "config": config,
         "preset": preset,
         "labels": labels,
+        "parent_run_id": parent_run_id,
         "source_db": source.get("source_db"),
         "source_catalog": source.get("source_catalog"),
         "source_schema": source.get("source_schema"),

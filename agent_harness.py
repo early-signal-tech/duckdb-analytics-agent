@@ -9,6 +9,7 @@
     uv run agent_harness.py --tpch                           # TPC-H sample data in memory
     uv run agent_harness.py --tpch --save-db tpch.duckdb --no-run   # build a reusable file
     uv run agent_harness.py --effort high --structured --quiet
+    uv run agent_harness.py --follow-up <RUN ID> --prompt "And in 1996?"   # on that run's data
     uv run agent_harness.py --traces-shell                   # read the traces in the duckdb CLI
 
 The database is always attached READ_ONLY. Traces are written through a background Quack
@@ -28,11 +29,12 @@ import duckdb
 from dotenv import load_dotenv
 
 from duckdb_agent import (
-    AgentConfig, configure_logging, connect_traces_db, request_data_source, reset_traces_db, run_agent, stop_traces_server,
+    AgentConfig, FollowUpError, configure_logging, connect_traces_db, request_data_source, reset_traces_db, run_agent, stop_traces_server,
 )
 from duckdb_agent.traces_server import (
     DEFAULT_PORT, TracesServerError, TracesServerOutdated, start_traces_server, state_paths,
 )
+from duckdb_agent.follow_up import parent_source
 from duckdb_agent.config import DEFAULT_EFFORT, DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, EFFORT_LEVELS
 # Re-exported: the CLI's data setup lives in the package so the app server can share it.
 from duckdb_agent.sources import (  # noqa: F401
@@ -44,7 +46,13 @@ DEFAULT_PROMPT = "Who are the top 5 customers by revenue, and how much revenue i
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ask Claude a question about DuckDB data.")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="The question to answer.")
+    parser.add_argument("--prompt", default=None, help="The question to answer.")
+    parser.add_argument(
+        "--follow-up", metavar="RUN_ID",
+        help="Ask --prompt as a follow-up to that run: its question, answer, and SQL go in as context. "
+             "With no data named, it runs on that run's data. It can switch to another database (--db), "
+             "not to --load files or --tpch data."
+    )
     parser.add_argument(
         "--table", action="append", dest="tables", metavar="TABLE",
         help="A table to focus on; its schema is preloaded. Repeatable. "
@@ -113,13 +121,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.no_run and not args.save_db:
         parser.error("--no-run needs --save-db")
+    if args.prompt is None:
+        if args.follow_up:
+            parser.error("--follow-up needs a --prompt: the follow-up question")
+        args.prompt = DEFAULT_PROMPT
+    if args.follow_up and (args.save_db or args.reset_traces):
+        parser.error("--follow-up reads the earlier run from the traces; it can't be used with --save-db or --reset-traces")
+    # A follow-up that names no data runs on its parent's (main looks it up).
+    args.data_from_parent = bool(args.follow_up) and not args.load and args.tpch is None and args.db is None
     if args.save_db:
         if args.db is not None:
             parser.error("--save-db and --db can't be used together; use --db to reuse the file later")
         if Path(args.save_db).exists():
             parser.error(f"{args.save_db} already exists; delete it or pick another path")
     # No data named: the TPC-H benchmark data at the default scale, in memory.
-    if not args.load and args.tpch is None and args.db in (None, IN_MEMORY):
+    if not args.load and args.tpch is None and args.db in (None, IN_MEMORY) and not args.data_from_parent:
         args.tpch = DEFAULT_TPCH_SCALE
     if args.tpch is not None and args.tpch <= 0:
         parser.error("--tpch scale factor must be positive")
@@ -188,6 +204,24 @@ def main(argv=None, client=None) -> int:
     if args.traces_shell:
         return open_traces_shell(args.traces_db, args.traces_port)
 
+    if args.reset_traces and reset_traces_db(args.traces_db):
+        print(f"Reset traces: deleted {args.traces_db}", file=sys.stderr)
+    try:
+        traces_conn = connect_traces_db(args.traces_db, server=not args.no_traces_server, port=args.traces_port)
+    except TracesServerOutdated as e:
+        print(f"Traces unavailable: {e}", file=sys.stderr)
+        return 1
+    if args.data_from_parent:
+        try:
+            source = parent_source(traces_conn, args.follow_up)
+        except FollowUpError as e:
+            print(f"Can't follow up: {e}", file=sys.stderr)
+            return 1
+        args.db = source.get("db", IN_MEMORY)
+        args.schema = args.schema or source.get("schema")
+        args.load = source.get("load", [])
+        args.tpch = source.get("tpch")
+
     if args.save_db:
         build_database(args.save_db, args.load, args.tpch)
         print(f"Saved database: {args.save_db} (reuse it with --db {args.save_db})", file=sys.stderr)
@@ -196,25 +230,23 @@ def main(argv=None, client=None) -> int:
         conn = connect(args.db, args.schema)
     else:
         conn = connect(args.db, args.schema, args.load, args.tpch)
-    if args.reset_traces and reset_traces_db(args.traces_db):
-        print(f"Reset traces: deleted {args.traces_db}", file=sys.stderr)
-    try:
-        traces_conn = connect_traces_db(args.traces_db, server=not args.no_traces_server, port=args.traces_port)
-    except TracesServerOutdated as e:
-        print(f"Traces unavailable: {e}", file=sys.stderr)
-        return 1
     config = AgentConfig(
         model=args.model,
         effort=args.effort,
         max_iterations=args.max_iterations,
         structured_answer=args.structured,
     )
-    result = run_agent(
-        conn, args.prompt, tables=args.tables, config=config, traces_conn=traces_conn, client=client,
-        source_db=None if args.db == IN_MEMORY else (args.save_db or args.db),
-        data_source=request_data_source(args.save_db, args.schema) if args.save_db
-        else request_data_source(args.db, args.schema, args.load or (), args.tpch),
-    )
+    try:
+        result = run_agent(
+            conn, args.prompt, tables=args.tables, config=config, traces_conn=traces_conn, client=client,
+            source_db=None if args.db == IN_MEMORY else (args.save_db or args.db),
+            data_source=request_data_source(args.save_db, args.schema) if args.save_db
+            else request_data_source(args.db, args.schema, args.load or (), args.tpch),
+            parent_run_id=args.follow_up,
+        )
+    except FollowUpError as e:
+        print(f"Can't follow up: {e}", file=sys.stderr)
+        return 1
     if args.quiet:
         print(result.text)  # verbose mode already logged it
     return 0 if result.status == "completed" else 1
