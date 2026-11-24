@@ -1,5 +1,6 @@
 """Opening the data the agent queries: DuckDB files (local or remote), ducklake: URIs,
-remote data files queried in place (s3://bucket/orders/*.parquet), loaded files, TPC-H."""
+remote data files queried in place (s3://bucket/orders/*.parquet), loaded files, TPC-H,
+and the agent's own traces (TRACES_SOURCE), read through the traces server."""
 
 import re
 from pathlib import Path
@@ -8,6 +9,10 @@ import duckdb
 
 
 IN_MEMORY = ":memory:"
+
+# A run's "db" that means the agent's own traces database. Its file is held by the traces
+# server (Quack), so it's read through that server, never opened directly.
+TRACES_SOURCE = "agent:traces"
 
 
 DEFAULT_TPCH_SCALE = 0.1  # ~100 MB of data, generated in a few seconds
@@ -148,6 +153,19 @@ def lock_down(conn: duckdb.DuckDBPyConnection, allowed: list[str] = ()) -> None:
         conn.execute("SET allowed_directories = ?", [allowed])
     conn.execute("SET enable_external_access = false")
     conn.execute("SET lock_configuration = true")
+
+
+def connect_traces(uri: str, token: str) -> duckdb.DuckDBPyConnection:
+    """The traces, attached as `source` through their Quack server (quack:host:port), for
+    the agent to query like any database. READ_ONLY is asked for, but a Quack catalog
+    doesn't enforce it, so the read-only SQL check (sql.py) is the guard, as for
+    in-memory data. Locked down like every source: the server's own address is the only
+    thing outside the connection it can reach."""
+    host = uri.split(":", 1)[1]  # quack:localhost:9494 -> localhost:9494
+    conn = duckdb.connect()
+    conn.execute("ATTACH ? AS source (TYPE quack, TOKEN ?, READ_ONLY)", [uri, token])
+    lock_down(conn, [f"http://{host}/"])
+    return conn
 
 
 def connect(db: str, schema: str | None, load: list[str] = (), tpch: float | None = None) -> duckdb.DuckDBPyConnection:
