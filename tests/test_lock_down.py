@@ -1,5 +1,7 @@
 """lock_down: the agent's SQL reaches the attached data and nothing else on disk."""
 
+import os
+
 import duckdb
 import pytest
 
@@ -72,3 +74,36 @@ def test_lock_down_on_a_callers_connection(db_file, secret):
     lock_down(conn)
     assert execute_query(conn, "SELECT a FROM source.t")["rows"] == [[1]]
     assert_blocked(execute_query(conn, f"SELECT * FROM read_csv('{secret}')"))
+
+
+def test_saved_secrets_still_work_after_the_lock_down(tmp_path):
+    """A DuckLake on S3 needs its saved S3 secret at the first data read, after the
+    lock-down. DuckDB loads saved secrets from disk lazily, so they're loaded first; the
+    secrets folder itself stays unreadable."""
+    secrets = tmp_path / "stored_secrets"
+    setup = duckdb.connect(config={"secret_directory": str(secrets)})
+    setup.execute("CREATE PERSISTENT SECRET s3_bucket (TYPE s3, KEY_ID 'AKIAFAKE', SECRET 'fake', SCOPE 's3://probe-bucket')")
+    setup.close()
+
+    conn = duckdb.connect(config={"secret_directory": str(secrets)})
+    lock_down(conn)
+    found = conn.execute("FROM which_secret('s3://probe-bucket/data.parquet', 's3')").fetchall()
+    assert found == [("s3_bucket", "PERSISTENT", "local_file")]
+    assert found == conn.cursor().execute("FROM which_secret('s3://probe-bucket/data.parquet', 's3')").fetchall()
+    assert_blocked(execute_query(conn, f"SELECT * FROM glob('{secrets}/*')"))
+
+
+def test_https_can_read_the_ca_certificates_and_nothing_next_to_them():
+    """HTTPS to S3 reads the system's CA bundle after the lock-down: that one file is
+    allowed (public certificates), not its folder."""
+    from duckdb_agent.sources import ca_bundle
+    bundle = ca_bundle()
+    if bundle is None:
+        pytest.skip("no CA bundle on this machine")
+    conn = duckdb.connect()
+    lock_down(conn)
+    # DuckDB stores the resolved path (on macOS /etc is /private/etc).
+    allowed = conn.execute("SELECT current_setting('allowed_paths')").fetchone()[0]
+    assert [os.path.realpath(p) for p in allowed] == [os.path.realpath(bundle)]
+    assert execute_query(conn, f"SELECT length(content) > 0 FROM read_text('{bundle}')")["rows"][0][0] is True
+    assert_blocked(execute_query(conn, "SELECT * FROM read_text('/etc/hosts')"))
