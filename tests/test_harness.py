@@ -144,7 +144,9 @@ def test_save_db_builds_a_reusable_file(tmp_path, capsys):
     csv = tmp_path / "sales.csv"
     csv.write_text("id,amount\n1,10\n2,20\n")
     path = tmp_path / "saved.duckdb"
-    assert agent_harness.main(["--load", str(csv), "--save-db", str(path), "--no-run"]) == 0
+    # Its own traces, without a server: the default would start one on the real traces port.
+    traces = ["--traces-db", str(tmp_path / "traces.duckdb"), "--no-traces-server"]
+    assert agent_harness.main(["--load", str(csv), "--save-db", str(path), "--no-run", *traces]) == 0
     assert "Saved database" in capsys.readouterr().err
     conn = agent_harness.connect(str(path), None)
     assert conn.execute("SELECT sum(amount) FROM sales").fetchone() == (30,)

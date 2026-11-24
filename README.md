@@ -74,6 +74,7 @@ A run can continue an earlier one: `run_agent(..., parent_run_id=...)`, `--follo
 - The parent must have finished. An unknown or still-running parent is refused before anything is traced (`FollowUpError`).
 - With no data named, a follow-up runs on the parent's data. It can switch to another database (a `--db` file, a `ducklake:` URI, remote data), and Claude is told what changed. It can't switch to `--load` files or `--tpch` data.
 - Only facts are stored: `agent_runs.parent_run_id`, `parent_run_id` in the `run_start` event, and a `follow_up_context` event naming the turns that went in. The digest is rebuilt from them. A conversation is the chain of `parent_run_id` links.
+- A run can ask about the traces themselves: `"source": {"db": "agent:traces"}` (`hello` reports it as `traces_source`). The traces file is held by the traces server, so it's read through that server (Quack). Quack doesn't enforce read-only, so the read-only SQL check is the guard, as for in-memory data. A follow-up can switch to it like any database.
 - A chat app reads conversations back over the app protocol. `conversations` lists a rack preset's conversations, most recently active first, with their turn count, title, cost and data. `conversation` returns one conversation's turns, oldest first, with each answer (`duckdb_agent/conversations.py`).
 
 ## Driving it from another program (the app protocol)

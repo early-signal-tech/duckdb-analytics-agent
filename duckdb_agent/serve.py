@@ -11,10 +11,11 @@ Requests:
         -> {"id": "h", "type": "hello", "protocol": 1, "version": "0.1.0",
             "traces_schema": "<SCHEMA_VERSION>", "defaults": {...AgentConfig fields},
             "effort_levels": [...], "priced_models": [...], "limits": {"max_tokens": ...},
-            "tools": [...]}
+            "tools": [...], "traces_source": "agent:traces" | null}
         "version" is the duck-harness package's; "traces_schema" names the traces tables
         and views this code writes (tracing.SCHEMA_VERSION). Engines that share a traces
-        file must agree on it.
+        file must agree on it. "traces_source" is the "db" that asks about the traces
+        themselves (read through the traces server); null when traces are off.
     {"id": "r1", "type": "run", "prompt": "...",
      "source": {"db": "tpch.duckdb", "schema": null} | {"load": ["a.csv"], "tpch": 0.1},
      "tables": ["orders"], "config": {"effort": "high", "max_iterations": 10, ...},
@@ -90,7 +91,7 @@ from .log import configure_logging, logger
 from .follow_up import FollowUpError, parent_source
 from .loop import run_agent
 from .serialization import json_dumps
-from .sources import IN_MEMORY, connect, use_statement
+from .sources import IN_MEMORY, TRACES_SOURCE, connect, connect_traces, use_statement
 from .traces_server import DEFAULT_PORT, connect_traces_db, server_status, stop_traces_server
 from .takes import list_takes, take_runs
 from .conversations import MAX_TURNS, conversation_turns, list_conversations
@@ -241,6 +242,11 @@ class Server:
     def open_source(self, source: dict) -> duckdb.DuckDBPyConnection:
         """A fresh connection to `source` for one run. The data is opened (or built) once
         per source and shared: cursor() is a new connection to the same database."""
+        if source["db"] == TRACES_SOURCE:
+            # Not shared: the traces server may have restarted (a new token) since the last run.
+            conn = self.connect_traces_source()
+            conn.execute(use_statement(source["db"], source["schema"]))
+            return conn
         key = json.dumps(source, sort_keys=True)
         with self._sources_lock:
             base = self._sources.get(key)
@@ -252,6 +258,15 @@ class Server:
         if use:
             conn.execute(use)
         return conn
+
+    def connect_traces_source(self) -> duckdb.DuckDBPyConnection:
+        """The traces as a run's data (source {"db": TRACES_SOURCE}), through the traces server."""
+        if self.traces_path is None:
+            raise RequestError("traces are off, so there are no traces to ask about")
+        state = server_status(self.traces_path)
+        if not state:
+            raise RequestError("the traces server isn't running, so the traces can't be read while runs write them")
+        return connect_traces(state["uri"], state["token"])
 
     # --- requests ---
 
@@ -276,6 +291,8 @@ class Server:
                 "limits": {"max_tokens": MAX_NON_STREAMING_TOKENS},
                 "tools": list(TOOL_NAMES),
                 "secret_types": duckdb_secrets.SECRET_TYPES,
+                # The "db" that asks about the traces themselves; null when traces are off.
+                "traces_source": TRACES_SOURCE if self.traces_path else None,
             })
         elif kind in ("takes", "take", "conversations", "conversation"):
             self.handle_takes(request_id, request)

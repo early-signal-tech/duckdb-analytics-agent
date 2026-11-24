@@ -390,8 +390,8 @@ def describe_source(conn: duckdb.DuckDBPyConnection) -> dict:
         """).fetchone()
     except (duckdb.Error, TypeError):
         return {"source_db": None, "source_catalog": None, "source_schema": None}
-    if path and db_type != "duckdb":
-        path = f"{db_type}:{path}"  # e.g. ducklake:metadata.ducklake
+    if path and db_type != "duckdb" and not path.startswith(f"{db_type}:"):
+        path = f"{db_type}:{path}"  # e.g. ducklake:metadata.ducklake (a Quack path is already quack:host:port)
     return {"source_db": path, "source_catalog": catalog, "source_schema": schema}
 
 
