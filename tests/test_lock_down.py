@@ -1,5 +1,7 @@
 """lock_down: the agent's SQL reaches the attached data and nothing else on disk."""
 
+import os
+
 import duckdb
 import pytest
 
@@ -100,6 +102,8 @@ def test_https_can_read_the_ca_certificates_and_nothing_next_to_them():
         pytest.skip("no CA bundle on this machine")
     conn = duckdb.connect()
     lock_down(conn)
-    assert conn.execute("SELECT current_setting('allowed_paths')").fetchone()[0] == [bundle]
+    # DuckDB stores the resolved path (on macOS /etc is /private/etc).
+    allowed = conn.execute("SELECT current_setting('allowed_paths')").fetchone()[0]
+    assert [os.path.realpath(p) for p in allowed] == [os.path.realpath(bundle)]
     assert execute_query(conn, f"SELECT length(content) > 0 FROM read_text('{bundle}')")["rows"][0][0] is True
     assert_blocked(execute_query(conn, "SELECT * FROM read_text('/etc/hosts')"))
