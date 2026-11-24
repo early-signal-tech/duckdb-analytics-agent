@@ -41,6 +41,15 @@ Requests:
         -> {"id": "k", "type": "take", "runs": [{run_id, prompt, answer, status, error,
             iterations, duration_ms, cost_usd, labels}, ...]}
         A take is one press of PLAY in the rack: a run, an A/B pair, or a setlist (takes.py).
+    {"id": "c", "type": "conversations", "rack_preset": "rack-…" | null, "limit": 50}
+        -> {"id": "c", "type": "conversations", "max_turns": 3, "conversations": [{root_run_id,
+            last_run_id, turns, title, started_at, ended_at, cost_usd, last_status,
+            data_source}, ...]}  (most recently active first)
+    {"id": "c", "type": "conversation", "run_id": "<any run in it, usually the last>"}
+        -> {"id": "c", "type": "conversation", "max_turns": 3, "turns": [{run_id,
+            parent_run_id, prompt, answer, status, error, iterations, queries, duration_ms,
+            cost_usd, started_at, data_source}, ...]}  (oldest first, up to run_id)
+        A conversation is a question and its follow-ups (conversations.py).
     {"id": "z", "type": "secrets"}
         -> {"id": "z", "type": "secrets", "secrets": [{name, type, provider, scope}, ...]}
     {"id": "z", "type": "secret_create", "name": "s3_main", "secret_type": "s3",
@@ -84,6 +93,7 @@ from .serialization import json_dumps
 from .sources import IN_MEMORY, connect, use_statement
 from .traces_server import DEFAULT_PORT, connect_traces_db, server_status, stop_traces_server
 from .takes import list_takes, take_runs
+from .conversations import MAX_TURNS, conversation_turns, list_conversations
 from .tracing import SCHEMA_VERSION, request_data_source, reset_traces_db
 from .usage import MODEL_PRICING
 
@@ -267,7 +277,7 @@ class Server:
                 "tools": list(TOOL_NAMES),
                 "secret_types": duckdb_secrets.SECRET_TYPES,
             })
-        elif kind in ("takes", "take"):
+        elif kind in ("takes", "take", "conversations", "conversation"):
             self.handle_takes(request_id, request)
         elif kind == "run":
             self.start_run(request)
@@ -312,19 +322,31 @@ class Server:
         }
 
     def handle_takes(self, request_id: str, request: dict) -> None:
-        """What a rack preset played (takes), or one take's runs, read from the traces."""
+        """What a rack preset played (takes or conversations), or one take's runs or one
+        conversation's turns, read from the traces."""
         if self.traces_path is None:
             self.send_error(request_id, "traces are off")
             return
         traces = None
         try:
             traces = self.traces()
-            if request["type"] == "takes":
+            kind = request["type"]
+            if kind in ("takes", "conversations"):
                 preset = request.get("rack_preset")
                 if preset is not None and not isinstance(preset, str):
                     raise ValueError('"rack_preset" must be a preset id or null')
                 limit = int(request.get("limit") or 50)
-                self.send({"id": request_id, "type": "takes", "takes": list_takes(traces, preset, limit)})
+                if kind == "takes":
+                    self.send({"id": request_id, "type": "takes", "takes": list_takes(traces, preset, limit)})
+                else:
+                    self.send({"id": request_id, "type": "conversations", "max_turns": MAX_TURNS,
+                               "conversations": list_conversations(traces, preset, limit)})
+            elif kind == "conversation":
+                run_id = request.get("run_id")
+                if not isinstance(run_id, str) or not run_id:
+                    raise ValueError('"run_id" must be a run in the conversation')
+                self.send({"id": request_id, "type": "conversation", "max_turns": MAX_TURNS,
+                           "turns": conversation_turns(traces, run_id)})
             else:
                 key = request.get("key")
                 if not isinstance(key, str) or not key:
