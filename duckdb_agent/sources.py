@@ -60,6 +60,19 @@ def use_statement(db: str, schema: str | None) -> str | None:
     return "USE source" + (f'."{schema}"' if schema else "")
 
 
+# Where DuckDB looks for the system's CA certificates (its own list, in its order). HTTPS
+# to S3 and the like reads one, so the lock-down allows that one file: public certificates.
+CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem",
+)
+
+
+def ca_bundle() -> str | None:
+    """The first CA certificate bundle that exists, or None."""
+    return next((path for path in CA_BUNDLES if Path(path).is_file()), None)
+
+
 # Data paths that need an extension to read. Once lock_down runs, extensions can't
 # autoload, so the one a remote DuckLake needs is loaded first.
 REMOTE_EXTENSIONS = {
@@ -149,8 +162,17 @@ def lock_down(conn: duckdb.DuckDBPyConnection, allowed: list[str] = ()) -> None:
         if extension:
             conn.execute(f"INSTALL {extension}")
             conn.execute(f"LOAD {extension}")
+    # DuckDB reads saved (persistent) secrets from disk the first time one is needed, which
+    # for a DuckLake on S3 is the first query that opens a data file: after the lock-down,
+    # when it can't read ~/.duckdb/stored_secrets any more. Load them now, while it can;
+    # the folder itself stays out of the agent's reach.
+    conn.execute("SELECT name FROM duckdb_secrets()").fetchall()
     if allowed:
         conn.execute("SET allowed_directories = ?", [allowed])
+    # HTTPS (remote data, a DuckLake on S3) needs the CA certificates: that one file.
+    bundle = ca_bundle()
+    if bundle:
+        conn.execute("SET allowed_paths = ?", [[bundle]])
     conn.execute("SET enable_external_access = false")
     conn.execute("SET lock_configuration = true")
 
