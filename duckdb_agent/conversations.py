@@ -2,10 +2,15 @@
 
 A conversation is a chain of runs linked by parent_run_id (see follow_up.py), starting at
 a run with no parent. Like takes, nothing about conversations is stored: they're worked
-out from agent_runs. A chat (the CH-1 device in the rack) lists a rack preset's
+out from agent_runs. A chat (CH-1 or CHAT in the rack) lists a rack preset's
 conversations and reopens one to show its turns or ask a follow-up.
 
-    list_conversations(traces, "rack-…")  -> newest activity first: {root_run_id,
+Each chat tags its runs with labels.chat ("ch1", "chat"), so each lists only its own
+conversations: CH-1 doesn't list CHAT's, and neither lists runs from DH-1 or the command
+line. CH-1's runs from before the tag (2026-11-28) have none; inside a rack preset, an
+untagged conversation is CH-1's, since CH-1 was the only chat then.
+
+    list_conversations(traces, "rack-…", chat="ch1")  -> newest activity first: {root_run_id,
         last_run_id, turns, title, started_at, ended_at, cost_usd, last_status, data_source}
     conversation_turns(traces, run_id)    -> the conversation up to run_id, oldest first:
         {run_id, parent_run_id, prompt, answer, status, error, iterations, queries,
@@ -35,10 +40,18 @@ def _iso(value):
     return value.isoformat() if value is not None else None
 
 
-def list_conversations(traces: TracesDB, rack_preset: str | None, limit: int = 50) -> list[dict]:
+# The chat that asked conversations before chats tagged their runs.
+UNTAGGED_CHAT = "ch1"
+
+
+def list_conversations(traces: TracesDB, rack_preset: str | None, limit: int = 50, chat: str | None = None) -> list[dict]:
     """A rack preset's conversations, the most recently active first. With no preset: those
-    started outside any rack preset."""
+    started outside any rack preset. With `chat`: only that chat's (labels.chat), plus,
+    for CH-1 in a rack preset, the untagged ones from before the tag."""
     preset = f"labels.rack_preset::VARCHAR = {_lit(rack_preset)}" if rack_preset else "labels.rack_preset IS NULL"
+    if chat is not None:
+        tagged = f"labels.chat::VARCHAR = {_lit(chat)}"
+        preset += f" AND ({tagged} OR labels.chat IS NULL)" if chat == UNTAGGED_CHAT and rack_preset else f" AND {tagged}"
     rows = traces.execute(f"""
         WITH RECURSIVE chain(run_id, root) AS (
             SELECT run_id, run_id FROM agent_runs

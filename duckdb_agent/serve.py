@@ -42,7 +42,7 @@ Requests:
         -> {"id": "k", "type": "take", "runs": [{run_id, prompt, answer, status, error,
             iterations, duration_ms, cost_usd, labels}, ...]}
         A take is one press of PLAY in the rack: a run, an A/B pair, or a setlist (takes.py).
-    {"id": "c", "type": "conversations", "rack_preset": "rack-…" | null, "limit": 50}
+    {"id": "c", "type": "conversations", "rack_preset": "rack-…" | null, "chat": "ch1", "limit": 50}
         -> {"id": "c", "type": "conversations", "max_turns": 3, "conversations": [{root_run_id,
             last_run_id, turns, title, started_at, ended_at, cost_usd, last_status,
             data_source}, ...]}  (most recently active first)
@@ -50,7 +50,8 @@ Requests:
         -> {"id": "c", "type": "conversation", "max_turns": 3, "turns": [{run_id,
             parent_run_id, prompt, answer, status, error, iterations, queries, duration_ms,
             cost_usd, started_at, data_source}, ...]}  (oldest first, up to run_id)
-        A conversation is a question and its follow-ups (conversations.py).
+        A conversation is a question and its follow-ups (conversations.py). "chat" (optional)
+        lists only one chat's conversations: the runs it tagged with labels.chat.
     {"id": "z", "type": "secrets"}
         -> {"id": "z", "type": "secrets", "secrets": [{name, type, provider, scope}, ...]}
     {"id": "z", "type": "secret_create", "name": "s3_main", "secret_type": "s3",
@@ -356,8 +357,11 @@ class Server:
                 if kind == "takes":
                     self.send({"id": request_id, "type": "takes", "takes": list_takes(traces, preset, limit)})
                 else:
+                    chat = request.get("chat")
+                    if chat is not None and not isinstance(chat, str):
+                        raise ValueError('"chat" must be a chat\'s tag, like "ch1", or null')
                     self.send({"id": request_id, "type": "conversations", "max_turns": MAX_TURNS,
-                               "conversations": list_conversations(traces, preset, limit)})
+                               "conversations": list_conversations(traces, preset, limit, chat)})
             elif kind == "conversation":
                 run_id = request.get("run_id")
                 if not isinstance(run_id, str) or not run_id:

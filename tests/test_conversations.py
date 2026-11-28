@@ -68,6 +68,23 @@ def test_conversations_outside_any_preset_and_limit(traces):
     assert len(list_conversations(traces, "rack-chat", limit=1)) == 1
 
 
+def test_each_chat_lists_its_own_conversations(traces):
+    # CHAT's conversation in the same rack preset, and tagged runs outside any preset.
+    add(traces, "c1", None, {**RACK, "chat": "chat"}, prompt="Gold orders?", minutes=11)
+    add(traces, "c2", "c1", {**RACK, "chat": "chat"}, prompt="By region?", minutes=13)
+    add(traces, "t1", None, {**RACK, "chat": "ch1"}, prompt="Tagged CH-1", minutes=12)
+    add(traces, "loose", None, {"chat": "ch1"}, minutes=14)
+    assert [c["root_run_id"] for c in list_conversations(traces, "rack-chat", chat="chat")] == ["c1"]
+    assert list_conversations(traces, "rack-chat", chat="chat")[0]["turns"] == 2
+    # CH-1: its tagged ones, and the untagged ones in the preset from before the tag.
+    assert [c["root_run_id"] for c in list_conversations(traces, "rack-chat", chat="ch1")] == ["t1", "n1", "late"]
+    # Outside a preset, untagged runs are DH-1's or the command line's, not CH-1's.
+    assert [c["root_run_id"] for c in list_conversations(traces, None, chat="ch1")] == ["loose"]
+    assert list_conversations(traces, None, chat="chat") == []
+    # No chat: as before, everything in the preset.
+    assert [c["root_run_id"] for c in list_conversations(traces, "rack-chat")] == ["c1", "t1", "n1", "late"]
+
+
 def test_a_conversations_turns_oldest_first(traces):
     turns = conversation_turns(traces, "n3")
     assert [t["run_id"] for t in turns] == ["n1", "n2", "n3"]
@@ -98,7 +115,11 @@ def test_serve_conversations_and_conversation(tmp_path, traces):
     server.handle({"id": "c", "type": "conversations", "rack_preset": "rack-chat"})
     server.handle({"id": "t", "type": "conversation", "run_id": "n2"})
     server.handle({"id": "x", "type": "conversation"})
-    convos, convo, bad = out.messages
+    server.handle({"id": "d", "type": "conversations", "rack_preset": "rack-chat", "chat": "chat"})
+    server.handle({"id": "e", "type": "conversations", "rack_preset": "rack-chat", "chat": 7})
+    convos, convo, bad, chat_only, bad_chat = out.messages
+    assert chat_only["conversations"] == []
+    assert bad_chat["type"] == "error" and "chat" in bad_chat["error"]
     assert convos["type"] == "conversations" and convos["max_turns"] == MAX_TURNS == 3
     assert [c["root_run_id"] for c in convos["conversations"]] == ["n1", "late"]
     assert convo["type"] == "conversation" and [t["run_id"] for t in convo["turns"]] == ["n1", "n2"]
